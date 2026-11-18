@@ -27,3 +27,7 @@ go.work.sum
 
 # Environment Files
 .env
+
+# Build Outputs
+/bin/
+/dist/

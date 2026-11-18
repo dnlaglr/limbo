@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: '3'
+
+vars:
+  BINARY: limbo{{exeExt}}
+
+tasks:
+  default:
+    desc: List available tasks
+    cmd: "{{.TASK_EXE}} --list"
+    silent: true
+  
+  build:
+    desc: Build the limbo binary into ./bin
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty
+      COMMIT:
+        sh: git rev-parse HEAD
+      DATE: '{{dateInZone "2006-01-02T15:04:05Z" now "UTC"}}'
+    cmd: go build -trimpath -ldflags "-s -w -X main.version={{.VERSION}} -X main.commit={{.COMMIT}} -X main.date={{.DATE}}" -o bin/{{.BINARY}} ./cmd/limbo
+
+  run:
+    desc: Run the limbo binary
+    cmd: go run ./cmd/limbo {{.CLI_ARGS}}
+  
+  demo:
+    desc: Show every UI building block with faked data
+    cmd: go run ./internal/ui/demo
+  
+  test:
+    desc: Run tests with the race detector
+    cmd: go test -race ./...
+
+  clean:
+    desc: Remove the build outputs
+    cmd: rm -rf bin dist
