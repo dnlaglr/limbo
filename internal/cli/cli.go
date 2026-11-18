@@ -8,9 +8,10 @@ import (
 
 	"charm.land/fang/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/spf13/cobra"
+
 	"github.com/dnlaglr/limbo/internal/app"
 	"github.com/dnlaglr/limbo/internal/ui"
-	"github.com/spf13/cobra"
 )
 
 const (

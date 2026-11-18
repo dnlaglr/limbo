@@ -3,9 +3,10 @@ package cli
 import (
 	"runtime"
 
+	"github.com/spf13/cobra"
+
 	"github.com/dnlaglr/limbo/internal/app"
 	"github.com/dnlaglr/limbo/internal/ui"
-	"github.com/spf13/cobra"
 )
 
 func newVersionCmd(a *app.App) *cobra.Command {

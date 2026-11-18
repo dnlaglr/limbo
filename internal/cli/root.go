@@ -4,8 +4,9 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/dnlaglr/limbo/internal/app"
 	"github.com/spf13/cobra"
+
+	"github.com/dnlaglr/limbo/internal/app"
 )
 
 func newRootCmd(a *app.App) *cobra.Command {
