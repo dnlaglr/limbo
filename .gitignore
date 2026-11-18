@@ -1,0 +1,33 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test Binaries
+*.test
+
+# Testing Artifacts
+*.out
+coverage.html
+coverage.txt
+coverage.xml
+*.coverprofile
+profile.cov
+
+# Dependency Directories
+# vendor/
+
+# Go Workspace Files
+go.work
+go.work.sum
+
+# Environment Files
+.env
+
+# Build Outputs
+/bin/
+/dist/
