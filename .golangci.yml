@@ -17,6 +17,7 @@ linters:
     presets:
       - common-false-positives
       - std-error-handling
+      - comments
 
 formatters:
   enable:
