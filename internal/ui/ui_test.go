@@ -44,3 +44,21 @@ func TestQuietHidesNarrationOnly(t *testing.T) {
 		t.Errorf("quiet hid a result: %q", out.String())
 	}
 }
+
+func TestPanelAlignsMultilineValues(t *testing.T) {
+	u, out, _ := newTestUI()
+	u.Panel("", Row{Key: "ID", Value: "m1"}, Row{Key: "Body", Value: "{\n  \"n\": 1\n}"})
+
+	var start, nested int
+	for line := range strings.Lines(out.String()) {
+		if i := strings.Index(line, "{"); i >= 0 {
+			start = i
+		}
+		if i := strings.Index(line, `"n"`); i >= 0 {
+			nested = i
+		}
+	}
+	if nested != start+2 {
+		t.Errorf("continuation line is not aligned with its value:\n%s", out.String())
+	}
+}

@@ -32,7 +32,7 @@ func (u *UI) Panel(title string, rows ...Row) {
 
 	key := subtleStyle.Width(keyWidth + keyGap)
 	for _, r := range visible {
-		lines = append(lines, key.Render(r.Key)+r.Value)
+		lines = append(lines, lipgloss.JoinHorizontal(lipgloss.Top, key.Render(r.Key), r.Value))
 	}
 
 	_, _ = lipgloss.Fprintln(u.out, panelStyle.Render(strings.Join(lines, "\n")))
