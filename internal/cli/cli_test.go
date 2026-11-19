@@ -8,16 +8,26 @@ import (
 	"testing"
 
 	"github.com/dnlaglr/limbo/internal/app"
+	"github.com/dnlaglr/limbo/internal/broker"
 )
 
 // Executes limbo with args against in-memory writers
 func run(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
+	return runWith(t, nil, args...)
+}
+
+func runWith(t *testing.T, brokers broker.Registry, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
 	t.Setenv("NO_COLOR", "")
 
 	var out, errOut bytes.Buffer
 	build := app.BuildInfo{Version: "v1.2.3", Commit: "0123456789abcdef", Date: "2026-11-18"}
-	code = Execute(context.Background(), app.New(build, &out, &errOut), args)
+	a := app.New(build, &out, &errOut)
+	if brokers != nil {
+		a.Brokers = brokers
+	}
+	code = Execute(context.Background(), a, args)
 
 	return code, out.String(), errOut.String()
 }

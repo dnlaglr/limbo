@@ -4,13 +4,16 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/dnlaglr/limbo/internal/broker"
+	"github.com/dnlaglr/limbo/internal/broker/rabbitmq"
 	"github.com/dnlaglr/limbo/internal/ui"
 )
 
 type App struct {
-	Build BuildInfo
-	UI    *ui.UI
-	Log   *slog.Logger
+	Build   BuildInfo
+	UI      *ui.UI
+	Log     *slog.Logger
+	Brokers broker.Registry
 
 	logLevel *slog.LevelVar
 }
@@ -23,6 +26,7 @@ func New(build BuildInfo, stdout, stderr io.Writer) *App {
 		Build:    build.resolve(),
 		UI:       ui.New(stdout, stderr),
 		Log:      slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})),
+		Brokers:  broker.Registry{"amqp": rabbitmq.Open, "amqps": rabbitmq.Open},
 		logLevel: level,
 	}
 }
