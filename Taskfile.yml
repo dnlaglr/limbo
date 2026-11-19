@@ -32,6 +32,18 @@ tasks:
     desc: Run tests with the race detector
     cmd: go test -race ./...
 
+  fmt:
+    desc: Format code and tidy go.mod
+    cmds:
+      - go mod tidy
+      - golangci-lint fmt ./...
+
+  lint:
+    desc: Run the lint checks from CI
+    cmds:
+      - go mod tidy -diff
+      - golangci-lint run ./...
+
   clean:
     desc: Remove the build outputs
     cmd: rm -rf bin dist
