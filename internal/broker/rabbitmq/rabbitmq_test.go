@@ -96,7 +96,7 @@ func TestRepublishing(t *testing.T) {
 	}
 }
 
-func TestPeekLeavesMessages(t *testing.T) {
+func TestBrowseLeavesMessages(t *testing.T) {
 	for _, queueType := range []string{"classic", "quorum"} {
 		t.Run(queueType, func(t *testing.T) {
 			ctx := context.Background()
@@ -104,23 +104,30 @@ func TestPeekLeavesMessages(t *testing.T) {
 			source := testQueue(queueType)
 			dlq := deadLetter(t, ch, source, queueType, 3)
 
-			for range 3 {
-				msgs, err := d.Peek(ctx, dlq, 2)
+			for _, stop := range []int{2, 1, 2} {
+				var msgs []broker.Message
+				err := d.Browse(ctx, dlq, 3, func(m broker.Message) bool {
+					msgs = append(msgs, m)
+					return len(msgs) < stop
+				})
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(msgs) != 2 || msgs[0].ID != "m0" || msgs[1].ID != "m1" {
-					t.Fatalf("peeked %+v, want m0 and m1 in order", msgs)
+				if len(msgs) != stop || msgs[0].ID != "m0" || msgs[stop-1].ID != "m"+strconv.Itoa(stop-1) {
+					t.Fatalf("browsed %+v, want m0 to m%d in order", msgs, stop-1)
 				}
 				if deaths := msgs[0].Deaths; len(deaths) != 1 || deaths[0].Queue != source || deaths[0].Reason != "rejected" {
 					t.Fatalf("deaths = %+v, want one rejection from %s", deaths, source)
 				}
 				waitForDepth(t, ch, dlq, 3)
 			}
+			if ids := browseIDs(t, d, dlq, 3); !slices.Equal(ids, []string{"m0", "m1", "m2"}) {
+				t.Fatalf("%s holds %q after browses that stopped early, want the original order", dlq, ids)
+			}
 
 			missing := source + ".missing"
-			if _, err := d.Peek(ctx, missing, 1); err == nil || err.Error() != `queue "`+missing+`" not found` {
-				t.Errorf("peek of a missing queue: err = %v", err)
+			if err := d.Browse(ctx, missing, 1, func(broker.Message) bool { return true }); err == nil || err.Error() != `queue "`+missing+`" not found` {
+				t.Errorf("browse of a missing queue: err = %v", err)
 			}
 		})
 	}
@@ -140,45 +147,30 @@ func TestReplay(t *testing.T) {
 				t.Fatalf("Depth() = %d, %v; want 6", n, err)
 			}
 
-			r, ok := d.(broker.Replayer)
-			if !ok {
-				t.Fatal("the RabbitMQ driver does not implement broker.Replayer")
-			}
-			replay := func(ctx context.Context, opts broker.ReplayOptions, wantErr error, want ...string) {
-				t.Helper()
-				var got []string
-				err := r.Replay(ctx, dlq, opts, func(r broker.Replayed) {
-					got = append(got, outcome(r))
-				})
-				if !errors.Is(err, wantErr) || !slices.Equal(got, want) {
-					t.Fatalf("Replay(%+v) = %q, %v; want %q, %v", opts, got, err, want, wantErr)
-				}
-			}
-
-			replay(ctx, broker.ReplayOptions{Limit: 2}, nil, "m0 → "+source, "m1 → "+source)
+			replay(t, d, dlq, firstN(2), nil, "m0 → "+source, "m1 → "+source)
 			waitForDepth(t, ch, dlq, 4)
 
 			missing := source + ".missing"
 			unroutable := ` ✗ no queue named "` + missing + `"`
-			replay(ctx, broker.ReplayOptions{To: missing, Limit: 2}, nil, "m2 → "+missing+unroutable, "m3 → "+missing+unroutable)
+			replay(t, d, dlq, broker.ReplayOptions{Selection: broker.Selection{Scan: 2}, To: missing}, nil, "m2 → "+missing+unroutable, "m3 → "+missing+unroutable)
 			waitForDepth(t, ch, dlq, 4)
-			if ids := peekIDs(t, d, dlq, 4); !slices.Equal(ids, []string{"m2", "m3", "m4", "orphan"}) {
+			if ids := browseIDs(t, d, dlq, 4); !slices.Equal(ids, []string{"m2", "m3", "m4", "orphan"}) {
 				t.Fatalf("%s holds %q after unroutable replays, want the original order", dlq, ids)
 			}
 
 			canceled, cancel := context.WithCancel(ctx)
-			err := r.Replay(canceled, dlq, broker.ReplayOptions{Limit: 4}, func(broker.Replayed) { cancel() })
+			err := d.(broker.Replayer).Replay(canceled, dlq, firstN(4), func(broker.Replayed) { cancel() })
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled Replay() err = %v, want context.Canceled", err)
 			}
 			waitForDepth(t, ch, dlq, 3)
 
-			replay(ctx, broker.ReplayOptions{Limit: 3}, nil, "m3 → "+source, "m4 → "+source, "orphan →  ✗ "+broker.ErrNoOrigin.Error())
+			replay(t, d, dlq, firstN(3), nil, "m3 → "+source, "m4 → "+source, "orphan →  ✗ "+broker.ErrNoOrigin.Error())
 			waitForDepth(t, ch, dlq, 1)
 			waitForDepth(t, ch, source, 5)
 
-			replayed, err := d.Peek(ctx, source, 5)
-			if err != nil {
+			var replayed []broker.Message
+			if err := d.Browse(ctx, source, 5, func(m broker.Message) bool { replayed = append(replayed, m); return true }); err != nil {
 				t.Fatal(err)
 			}
 			for i, m := range replayed {
@@ -187,6 +179,80 @@ func TestReplay(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFilteredReplay(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			d, ch := connect(t)
+			base := testQueue(queueType)
+			dlq, orders, payments := base+".dlq", base+".orders", base+".payments"
+			declare(t, ch, dlq, queueType, amqp.Table{})
+			declare(t, ch, orders, queueType, deadLettersTo(dlq))
+			capped := deadLettersTo(dlq)
+			capped["x-max-length"] = int64(1)
+			declare(t, ch, payments, queueType, capped)
+
+			reject(t, ch, orders, amqp.Publishing{MessageId: "m0"})
+			waitForDepth(t, ch, dlq, 1)
+			reject(t, ch, payments, amqp.Publishing{MessageId: "m1"})
+			waitForDepth(t, ch, dlq, 2)
+			publish(t, ch, payments, amqp.Publishing{MessageId: "m2"})
+			publish(t, ch, payments, amqp.Publishing{MessageId: "overflow"})
+			waitForDepth(t, ch, dlq, 3)
+			reject(t, ch, orders, amqp.Publishing{MessageId: "m3", Headers: amqp.Table{"tenant": "acme"}})
+			waitForDepth(t, ch, dlq, 4)
+			publish(t, ch, dlq, amqp.Publishing{MessageId: "orphan"})
+			waitForDepth(t, ch, dlq, 5)
+
+			var seeded []string
+			err := d.Browse(context.Background(), dlq, 5, func(m broker.Message) bool {
+				seeded = append(seeded, m.ID+" "+m.Reason()+" "+m.Origin())
+				return true
+			})
+			want := []string{"m0 rejected " + orders, "m1 rejected " + payments, "m2 maxlen " + payments, "m3 rejected " + orders, "orphan  "}
+			if err != nil || !slices.Equal(seeded, want) {
+				t.Fatalf("seeded %q, %v; want %q", seeded, err, want)
+			}
+			waitForDepth(t, ch, dlq, 5)
+
+			skipped := " ✗ " + broker.ErrSkipped.Error()
+			fromOrders := broker.Filter{Sources: broker.Rule[string]{Any: []string{orders}}}
+			replay(t, d, dlq, broker.ReplayOptions{Selection: broker.Selection{Filter: fromOrders, Scan: 5}}, nil,
+				"m0 → "+orders, "m1 → "+skipped, "m2 → "+skipped, "m3 → "+orders, "orphan → "+skipped)
+			waitForDepth(t, ch, dlq, 3)
+			if ids := browseIDs(t, d, dlq, 3); !slices.Equal(ids, []string{"m1", "m2", "orphan"}) {
+				t.Fatalf("%s holds %q after a filtered replay, want the skipped messages in order", dlq, ids)
+			}
+
+			overflowed := broker.Filter{Reasons: broker.Rule[string]{Any: []string{"maxlen"}}}
+			replay(t, d, dlq, broker.ReplayOptions{Selection: broker.Selection{Filter: overflowed, Limit: 1, Scan: 3}, To: orders}, nil,
+				"m1 → "+skipped, "m2 → "+orders)
+			waitForDepth(t, ch, dlq, 2)
+			if ids := browseIDs(t, d, dlq, 2); !slices.Equal(ids, []string{"m1", "orphan"}) {
+				t.Fatalf("%s holds %q after a limited replay, want m1 and orphan", dlq, ids)
+			}
+			waitForDepth(t, ch, orders, 3)
+			if ids := browseIDs(t, d, orders, 3); !slices.Equal(ids, []string{"m0", "m3", "m2"}) {
+				t.Fatalf("%s holds %q, want the replayed m0, m3 and m2", orders, ids)
+			}
+		})
+	}
+}
+
+func firstN(n int) broker.ReplayOptions {
+	return broker.ReplayOptions{Selection: broker.Selection{Scan: n}}
+}
+
+func replay(t *testing.T, d broker.Driver, queue string, opts broker.ReplayOptions, wantErr error, want ...string) {
+	t.Helper()
+	var got []string
+	err := d.(broker.Replayer).Replay(context.Background(), queue, opts, func(r broker.Replayed) {
+		got = append(got, outcome(r))
+	})
+	if !errors.Is(err, wantErr) || !slices.Equal(got, want) {
+		t.Fatalf("Replay(%+v) = %q, %v; want %q, %v", opts, got, err, want, wantErr)
 	}
 }
 
@@ -199,16 +265,11 @@ func outcome(r broker.Replayed) string {
 	return s
 }
 
-func peekIDs(t *testing.T, d broker.Driver, queue string, n int) []string {
+func browseIDs(t *testing.T, d broker.Driver, queue string, n int) []string {
 	t.Helper()
-	msgs, err := d.Peek(context.Background(), queue, n)
-	if err != nil {
+	var ids []string
+	if err := d.Browse(context.Background(), queue, n, func(m broker.Message) bool { ids = append(ids, m.ID); return true }); err != nil {
 		t.Fatal(err)
-	}
-
-	ids := make([]string, len(msgs))
-	for i, m := range msgs {
-		ids[i] = m.ID
 	}
 
 	return ids
@@ -254,33 +315,48 @@ func testQueue(queueType string) string {
 func deadLetter(t *testing.T, ch *amqp.Channel, source, queueType string, n int) string {
 	t.Helper()
 	dlq := source + ".dlq"
-	declare := func(name string, args amqp.Table) {
-		args["x-queue-type"] = queueType
-		if _, err := ch.QueueDeclare(name, true, false, false, false, args); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _, _ = ch.QueueDelete(name, false, false, false) })
-	}
-	declare(dlq, amqp.Table{})
-	declare(source, amqp.Table{"x-dead-letter-exchange": "", "x-dead-letter-routing-key": dlq})
+	declare(t, ch, dlq, queueType, amqp.Table{})
+	declare(t, ch, source, queueType, deadLettersTo(dlq))
 
-	for i := range n {
-		publish(t, ch, source, amqp.Publishing{MessageId: "m" + strconv.Itoa(i), Body: []byte(`{"n":` + strconv.Itoa(i) + `}`)})
+	msgs := make([]amqp.Publishing, n)
+	for i := range msgs {
+		msgs[i] = amqp.Publishing{MessageId: "m" + strconv.Itoa(i), Body: []byte(`{"n":` + strconv.Itoa(i) + `}`)}
 	}
-	waitForDepth(t, ch, source, n)
+	reject(t, ch, source, msgs...)
+	waitForDepth(t, ch, dlq, n)
 
-	for range n {
-		d, ok, err := ch.Get(source, false)
+	return dlq
+}
+
+func declare(t *testing.T, ch *amqp.Channel, name, queueType string, args amqp.Table) {
+	t.Helper()
+	args["x-queue-type"] = queueType
+	if _, err := ch.QueueDeclare(name, true, false, false, false, args); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = ch.QueueDelete(name, false, false, false) })
+}
+
+func deadLettersTo(dlq string) amqp.Table {
+	return amqp.Table{"x-dead-letter-exchange": "", "x-dead-letter-routing-key": dlq}
+}
+
+func reject(t *testing.T, ch *amqp.Channel, queue string, msgs ...amqp.Publishing) {
+	t.Helper()
+	for _, msg := range msgs {
+		publish(t, ch, queue, msg)
+	}
+	waitForDepth(t, ch, queue, len(msgs))
+
+	for range msgs {
+		d, ok, err := ch.Get(queue, false)
 		if err != nil || !ok {
-			t.Fatalf("get from %s: ok %v, err %v", source, ok, err)
+			t.Fatalf("get from %s: ok %v, err %v", queue, ok, err)
 		}
 		if err := d.Reject(false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	waitForDepth(t, ch, dlq, n)
-
-	return dlq
 }
 
 func publish(t *testing.T, ch *amqp.Channel, queue string, msg amqp.Publishing) {
@@ -290,7 +366,7 @@ func publish(t *testing.T, ch *amqp.Channel, queue string, msg amqp.Publishing) 
 	}
 }
 
-// Quorum queues apply returns asynchronously, so depth settles shortly after a peek
+// Quorum queues apply returns asynchronously, so depth settles shortly after a browse
 func waitForDepth(t *testing.T, ch *amqp.Channel, queue string, n int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

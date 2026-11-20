@@ -33,6 +33,7 @@ type peekOptions struct {
 	url    string
 	limit  int
 	output string
+	filter filterOptions
 }
 
 var peekRenderers = map[string]func(*app.App, []broker.Message) error{
@@ -48,10 +49,14 @@ func newPeekCmd(a *app.App) *cobra.Command {
 		Short: "Show dead-lettered messages without consuming them",
 		Long: `Peek shows the messages waiting in a dead-letter queue and leaves them there.
 
-Limbo holds up to --limit messages while it reads them, then returns them to the queue in their original order.
-Brokers may record that as a delivery: RabbitMQ marks the messages as redelivered, and quorum queues before
-RabbitMQ 4.3 count each peek toward their delivery limit.`,
+Limbo holds every message it reads until it is done, then returns them all to the queue in their original order. It
+reads until it has --limit messages that match, or until it reaches the end of the queue as counted when it started.
+Brokers may record each read as a delivery: RabbitMQ marks the messages as redelivered, and quorum queues before
+RabbitMQ 4.3 count each peek toward their delivery limit.
+
+` + filterHelp,
 		Example: `  limbo peek orders.dlq --url amqp://guest:guest@localhost:5672/
+  limbo peek orders.dlq --reason rejected --from orders --newer-than 1h
   LIMBO_URL=amqps://user:pass@broker:5671/prod limbo peek orders.dlq -n 50 -o json | jq .body`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -61,8 +66,9 @@ RabbitMQ 4.3 count each peek toward their delivery limit.`,
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.url, "url", "", urlUsage)
-	flags.IntVarP(&opts.limit, "limit", "n", 10, "maximum number of messages to show")
+	flags.IntVarP(&opts.limit, "limit", "n", 10, "maximum number of matching messages to show")
 	flags.StringVarP(&opts.output, "output", "o", "text", "output format: text or json")
+	addFilterFlags(cmd, &opts.filter)
 
 	return cmd
 }
@@ -87,27 +93,35 @@ func runPeek(ctx context.Context, a *app.App, queue string, opts peekOptions) er
 	}
 	defer d.Close()
 
-	var msgs []broker.Message
-	err = a.UI.Step(ctx, "Reading "+queue, func(ctx context.Context) (err error) {
-		msgs, err = d.Peek(ctx, queue, opts.limit)
-		return err
-	})
+	depth, err := count(ctx, a, d, queue)
 	if err != nil {
 		return err
 	}
-
-	if len(msgs) == 0 {
+	if depth == 0 {
 		a.UI.Info(queue + " is empty")
 		return nil
 	}
 
-	if err := render(a, msgs); err != nil {
-		return err
-	}
-	warnDeliveries(a, queue, msgs)
-	a.UI.Success("Put " + countMessages(len(msgs)) + " back on " + queue)
+	sel := broker.Selection{Filter: opts.filter.build(time.Now()), Limit: opts.limit, Scan: depth}
+	var msgs []broker.Message
+	most := 0
+	scanned, err := browse(ctx, a, d, queue, sel, func(m broker.Message) {
+		msgs = append(msgs, m)
+		most = max(most, m.DeliveryCount)
+	})
 
-	return nil
+	if len(msgs) > 0 {
+		err = errors.Join(err, render(a, msgs))
+		warnDeliveries(a, queue, most)
+	}
+	if !sel.Filter.IsZero() {
+		a.UI.Info(fmt.Sprintf("%d of %s matched", len(msgs), countMessages(scanned)))
+	}
+	if err == nil {
+		a.UI.Success("Put " + countMessages(scanned) + " back on " + queue)
+	}
+
+	return err
 }
 
 func brokerURL(flag string) (*url.URL, error) {
@@ -128,12 +142,7 @@ func connect(ctx context.Context, a *app.App, u *url.URL) (d broker.Driver, err 
 	return d, err
 }
 
-func warnDeliveries(a *app.App, queue string, msgs []broker.Message) {
-	most := 0
-	for _, m := range msgs {
-		most = max(most, m.DeliveryCount)
-	}
-
+func warnDeliveries(a *app.App, queue string, most int) {
 	if most > 0 {
 		a.UI.Warn(fmt.Sprintf("Messages in %s were already delivered up to %d times. "+
 			"Queues with a delivery limit drop or dead-letter messages past it, and some brokers count each peek.", queue, most))

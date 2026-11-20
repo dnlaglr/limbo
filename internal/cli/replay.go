@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,13 +27,16 @@ type replayOptions struct {
 	dryRun bool
 	yes    bool
 	output string
+	filter filterOptions
 }
 
 type replayRun struct {
 	queue   string
-	total   int
 	dryRun  bool
+	sel     broker.Selection
+	subject string
 	results []broker.Replayed
+	skipped int
 }
 
 type replayRecord struct {
@@ -45,6 +51,8 @@ var replayRenderers = map[string]func(*app.App, *replayRun) error{
 	"json": renderReplayJSON,
 }
 
+var errUnconfirmed = errors.New("refusing to replay without confirmation: pass --yes, or --dry-run to preview")
+
 func newReplayCmd(a *app.App) *cobra.Command {
 	var opts replayOptions
 
@@ -55,15 +63,19 @@ func newReplayCmd(a *app.App) *cobra.Command {
 Messages with no dead-letter history stay where they are unless you pass --to.
 
 A message leaves the dead-letter queue only after the broker confirms its copy reached the destination, and anything
-limbo cannot replay goes back in its original order. Nothing is lost, but if the connection drops between the confirm
-and the acknowledgement, the message ends up in both queues, so consumers should tolerate duplicates.
+limbo cannot replay or skips goes back in its original order. Nothing is lost, but if the connection drops between the
+confirm and the acknowledgement, the message ends up in both queues, so consumers should tolerate duplicates.
 
 On RabbitMQ, replayed messages drop the broker's x-death, x-first-death-*, x-last-death-*, x-delivery-count and
 x-acquired-count headers and carry x-limbo-replay-count and x-limbo-replayed-at instead.
 
 Limbo asks before it replays. Pass --yes to skip the question, which is required without a terminal, or --dry-run to
-see where each message would go without moving anything.`,
+see where each message would go without moving anything. With filters, limbo reads the queue once to count the
+matches before it asks, and then replays no more than the messages it counted.
+
+` + filterHelp,
 		Example: `  limbo replay orders.dlq --dry-run
+  limbo replay orders.dlq --reason rejected --from orders --newer-than 1h
   limbo replay orders.dlq --to orders.v2 -n 100 --rate 50 --yes`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -74,11 +86,12 @@ see where each message would go without moving anything.`,
 	flags := cmd.Flags()
 	flags.StringVar(&opts.url, "url", "", urlUsage)
 	flags.StringVar(&opts.to, "to", "", "queue to replay into instead of the queue each message died in")
-	flags.IntVarP(&opts.limit, "limit", "n", 0, "maximum number of messages to replay (default all)")
+	flags.IntVarP(&opts.limit, "limit", "n", 0, "maximum number of matching messages to replay (default all)")
 	flags.Float64Var(&opts.rate, "rate", 0, "maximum messages per second (default unlimited)")
 	flags.BoolVar(&opts.dryRun, "dry-run", false, "show where each message would go without moving anything")
 	flags.BoolVarP(&opts.yes, "yes", "y", false, "replay without asking first")
 	flags.StringVarP(&opts.output, "output", "o", "text", "output format: text or json")
+	addFilterFlags(cmd, &opts.filter)
 
 	return cmd
 }
@@ -87,6 +100,9 @@ func runReplay(ctx context.Context, a *app.App, in io.Reader, queue string, opts
 	render, err := opts.validate(queue)
 	if err != nil {
 		return err
+	}
+	if !opts.yes && !opts.dryRun && !a.UI.CanPrompt(in) {
+		return errUnconfirmed
 	}
 
 	u, err := brokerURL(opts.url)
@@ -105,20 +121,27 @@ func runReplay(ctx context.Context, a *app.App, in io.Reader, queue string, opts
 		return fmt.Errorf("replay is not supported for %s:// brokers", u.Scheme)
 	}
 
-	run := &replayRun{queue: queue, dryRun: opts.dryRun}
-	if run.total, err = countReplay(ctx, a, d, queue, opts); err != nil {
+	depth, err := count(ctx, a, d, queue, opts.to)
+	if err != nil {
 		return err
 	}
-	if run.total == 0 {
+	if depth == 0 {
 		a.UI.Info(queue + " is empty")
 		return nil
 	}
 
-	if opts.dryRun {
+	run := newReplayRun(queue, depth, opts)
+	if opts.dryRun || !run.sel.Filter.IsZero() && !opts.yes {
 		if err := planReplay(ctx, a, d, run, opts.to); err != nil {
 			return err
 		}
-		return render(a, run)
+		if opts.dryRun {
+			return render(a, run)
+		}
+		if len(run.results) == 0 {
+			a.UI.Info("No messages in " + queue + " matched")
+			return nil
+		}
 	}
 
 	if !opts.yes {
@@ -147,39 +170,38 @@ func (o replayOptions) validate(queue string) (func(*app.App, *replayRun) error,
 	return render, nil
 }
 
-// The count is fixed before anything moves, so messages that fail again and return to the queue are not replayed twice
-func countReplay(ctx context.Context, a *app.App, d broker.Driver, queue string, opts replayOptions) (n int, err error) {
-	err = a.UI.Step(ctx, "Counting "+queue, func(ctx context.Context) (err error) {
-		if opts.to != "" {
-			if _, err := d.Depth(ctx, opts.to); err != nil {
-				return err
-			}
+// The run never reads past the depth counted before anything moves, so messages that fail again and return to the queue are not replayed twice
+func newReplayRun(queue string, depth int, opts replayOptions) *replayRun {
+	run := &replayRun{
+		queue:   queue,
+		dryRun:  opts.dryRun,
+		sel:     broker.Selection{Filter: opts.filter.build(time.Now()), Limit: opts.limit, Scan: depth},
+		subject: "matching messages",
+	}
+	if run.sel.Filter.IsZero() {
+		if opts.limit > 0 {
+			run.sel.Scan = min(depth, opts.limit)
 		}
-
-		n, err = d.Depth(ctx, queue)
-		return err
-	})
-	if opts.limit > 0 {
-		n = min(n, opts.limit)
+		run.subject = countMessages(run.sel.Scan)
 	}
 
-	return n, err
+	return run
 }
 
+// The replay that follows a plan covers only the messages the plan read and moves no more than it matched
 func planReplay(ctx context.Context, a *app.App, d broker.Driver, run *replayRun, to string) error {
-	var msgs []broker.Message
-	err := a.UI.Step(ctx, "Reading "+run.queue, func(ctx context.Context) (err error) {
-		msgs, err = d.Peek(ctx, run.queue, run.total)
-		return err
+	target := broker.ReplayOptions{To: to}
+	scanned, err := browse(ctx, a, d, run.queue, run.sel, func(m broker.Message) {
+		r := broker.Replayed{Message: m}
+		r.To, r.Err = target.Target(m)
+		run.results = append(run.results, r)
 	})
 
-	opts := broker.ReplayOptions{To: to}
-	for _, m := range msgs {
-		r := broker.Replayed{Message: m}
-		r.To, r.Err = opts.Target(m)
-		run.results = append(run.results, r)
+	run.skipped = scanned - len(run.results)
+	run.sel.Scan, run.sel.Limit = scanned, len(run.results)
+	if !run.sel.Filter.IsZero() {
+		run.subject = fmt.Sprintf("%d of %s", len(run.results), countMessages(scanned))
 	}
-	run.total = len(run.results)
 
 	return err
 }
@@ -189,11 +211,8 @@ func confirmReplay(ctx context.Context, a *app.App, in io.Reader, run *replayRun
 		to = "the queues they died in"
 	}
 
-	ok, err := a.UI.Confirm(ctx, in, fmt.Sprintf("Replay %s from %s to %s?", countMessages(run.total), run.queue, to))
-	switch {
-	case errors.Is(err, ui.ErrNoTerminal):
-		return false, errors.New("refusing to replay without confirmation: pass --yes, or --dry-run to preview")
-	case err == nil && !ok:
+	ok, err := a.UI.Confirm(ctx, in, fmt.Sprintf("Replay %s from %s to %s?", run.subject, run.queue, to))
+	if err == nil && !ok {
 		a.UI.Info("Nothing was replayed")
 	}
 
@@ -213,12 +232,17 @@ func replay(ctx context.Context, a *app.App, r broker.Replayer, run *replayRun, 
 		}
 	}
 
-	title := fmt.Sprintf("Replaying %s from %s", countMessages(run.total), run.queue)
+	run.results, run.skipped = nil, 0
+	title := fmt.Sprintf("Replaying %s from %s", run.subject, run.queue)
 	return a.UI.Progress(ctx, title, func(ctx context.Context, set func(float64)) error {
-		return r.Replay(ctx, run.queue, broker.ReplayOptions{To: opts.to, Limit: run.total}, func(res broker.Replayed) {
-			run.results = append(run.results, res)
-			set(float64(len(run.results)) / float64(run.total))
-			pace()
+		return r.Replay(ctx, run.queue, broker.ReplayOptions{Selection: run.sel, To: opts.to}, func(res broker.Replayed) {
+			if errors.Is(res.Err, broker.ErrSkipped) {
+				run.skipped++
+			} else {
+				run.results = append(run.results, res)
+				pace()
+			}
+			set(float64(len(run.results)+run.skipped) / float64(run.sel.Scan))
 		})
 	})
 }
@@ -264,7 +288,10 @@ func renderReplayText(a *app.App, run *replayRun) error {
 		{Key: replayedKey, Value: tally(replayed)},
 		{Key: returnedKey, Value: tally(returned)},
 	}
-	if left := run.total - len(run.results); left > 0 {
+	if run.skipped > 0 {
+		rows = append(rows, ui.Row{Key: "Skipped", Value: countMessages(run.skipped)})
+	}
+	if left := run.sel.Scan - len(run.results) - run.skipped; left > 0 && !run.sel.Full(len(run.results)) {
 		rows = append(rows, ui.Row{Key: "Not reached", Value: countMessages(left)})
 	}
 	for i := range rows {
@@ -305,17 +332,21 @@ func replayStatus(replayed, dryRun bool) string {
 
 func tally(values []string) string {
 	counts := map[string]int{}
-	var order []string
 	for _, v := range values {
-		if counts[v] == 0 {
-			order = append(order, v)
-		}
 		counts[v]++
 	}
 
-	lines := make([]string, len(order))
-	for i, v := range order {
-		lines[i] = fmt.Sprintf("%s ×%d", v, counts[v])
+	return formatCounts(counts)
+}
+
+func formatCounts(counts map[string]int) string {
+	keys := slices.SortedFunc(maps.Keys(counts), func(a, b string) int {
+		return cmp.Or(cmp.Compare(counts[b], counts[a]), strings.Compare(a, b))
+	})
+
+	lines := make([]string, len(keys))
+	for i, k := range keys {
+		lines[i] = fmt.Sprintf("%s ×%d", k, counts[k])
 	}
 
 	return strings.Join(lines, "\n")
