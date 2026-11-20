@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -48,9 +49,46 @@ func (m Message) MarshalJSON() ([]byte, error) {
 	}{message(m), body, encoding})
 }
 
+// Deaths are ordered most recent first so the 0 index names the queue the message last died in
+func (m Message) Origin() string {
+	if len(m.Deaths) == 0 {
+		return ""
+	}
+
+	return m.Deaths[0].Queue
+}
+
 type Driver interface {
 	Peek(ctx context.Context, queue string, limit int) ([]Message, error)
+	Depth(ctx context.Context, queue string) (int, error)
 	Close() error
+}
+
+// Writes are optional capabilities found by type assertion so each broker implements only what it supports
+type Replayer interface {
+	Replay(ctx context.Context, queue string, opts ReplayOptions, each func(Replayed)) error
+}
+
+type ReplayOptions struct {
+	To    string
+	Limit int
+}
+
+var ErrNoOrigin = errors.New("no dead-letter history, pass --to to choose a destination")
+
+func (o ReplayOptions) Target(m Message) (string, error) {
+	to := cmp.Or(o.To, m.Origin())
+	if to == "" {
+		return "", ErrNoOrigin
+	}
+
+	return to, nil
+}
+
+type Replayed struct {
+	Message Message
+	To      string
+	Err     error
 }
 
 type Opener func(ctx context.Context, u *url.URL) (Driver, error)

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 type fakeDriver struct {
 	msgs   []broker.Message
 	err    error
+	depths map[string]int
 	queue  string
 	limit  int
 	closed bool
@@ -24,12 +26,21 @@ func (f *fakeDriver) Peek(_ context.Context, queue string, limit int) ([]broker.
 	return f.msgs, f.err
 }
 
+func (f *fakeDriver) Depth(_ context.Context, queue string) (int, error) {
+	n, ok := f.depths[queue]
+	if !ok {
+		return 0, fmt.Errorf("queue %q not found", queue)
+	}
+
+	return n, nil
+}
+
 func (f *fakeDriver) Close() error {
 	f.closed = true
 	return nil
 }
 
-func fakeBrokers(d *fakeDriver) broker.Registry {
+func fakeBrokers(d broker.Driver) broker.Registry {
 	return broker.Registry{"fake": func(context.Context, *url.URL) (broker.Driver, error) { return d, nil }}
 }
 

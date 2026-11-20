@@ -2,8 +2,10 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -57,29 +59,50 @@ func TestToMessageWithoutHeaders(t *testing.T) {
 	}
 }
 
-// Requires a broker, e.g. LIMBO_TEST_AMQP_URL=amqp://guest:guest@localhost:5672/
-func TestPeekLeavesMessages(t *testing.T) {
-	rawURL := os.Getenv("LIMBO_TEST_AMQP_URL")
-	if rawURL == "" {
-		t.Skip("LIMBO_TEST_AMQP_URL is not set")
-	}
-	u, err := broker.ParseURL(rawURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestRepublishing(t *testing.T) {
+	now := time.Date(2026, 11, 19, 9, 30, 0, 0, time.UTC)
 
+	got := republishing(&amqp.Delivery{
+		MessageId:     "4f1c2a7e",
+		ContentType:   "application/json",
+		DeliveryMode:  amqp.Persistent,
+		Priority:      5,
+		CorrelationId: "c-1",
+		Timestamp:     now.Add(-time.Hour),
+		Body:          []byte(`{"orderId":1042}`),
+		Headers: amqp.Table{
+			"tenant":              "acme",
+			"x-delivery-count":    int64(4),
+			"x-acquired-count":    int64(6),
+			"x-first-death-queue": "orders",
+			"x-last-death-reason": "rejected",
+			"x-death":             []any{amqp.Table{"queue": "orders", "reason": "rejected", "count": int64(3)}},
+			replayCountHeader:     int64(2),
+		},
+	}, now)
+
+	want := amqp.Publishing{
+		MessageId:     "4f1c2a7e",
+		ContentType:   "application/json",
+		DeliveryMode:  amqp.Persistent,
+		Priority:      5,
+		CorrelationId: "c-1",
+		Timestamp:     now.Add(-time.Hour),
+		Body:          []byte(`{"orderId":1042}`),
+		Headers:       amqp.Table{"tenant": "acme", replayCountHeader: int64(3), replayedAtHeader: now},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("republishing() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+func TestPeekLeavesMessages(t *testing.T) {
 	for _, queueType := range []string{"classic", "quorum"} {
 		t.Run(queueType, func(t *testing.T) {
 			ctx := context.Background()
-			ch := channel(t, rawURL)
-			source := "limbo.test." + queueType + "." + strconv.FormatInt(time.Now().UnixNano(), 36)
+			d, ch := connect(t)
+			source := testQueue(queueType)
 			dlq := deadLetter(t, ch, source, queueType, 3)
-
-			d, err := Open(ctx, u)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { d.Close() })
 
 			for range 3 {
 				msgs, err := d.Peek(ctx, dlq, 2)
@@ -89,8 +112,8 @@ func TestPeekLeavesMessages(t *testing.T) {
 				if len(msgs) != 2 || msgs[0].ID != "m0" || msgs[1].ID != "m1" {
 					t.Fatalf("peeked %+v, want m0 and m1 in order", msgs)
 				}
-				if deaths := msgs[0].Deaths; len(deaths) != 1 || deaths[0].Queue != source || deaths[0].Reason != "expired" {
-					t.Fatalf("deaths = %+v, want one expiry from %s", deaths, source)
+				if deaths := msgs[0].Deaths; len(deaths) != 1 || deaths[0].Queue != source || deaths[0].Reason != "rejected" {
+					t.Fatalf("deaths = %+v, want one rejection from %s", deaths, source)
 				}
 				waitForDepth(t, ch, dlq, 3)
 			}
@@ -103,7 +126,131 @@ func TestPeekLeavesMessages(t *testing.T) {
 	}
 }
 
-// Publishes n messages to an instantly expiring queue so they land in the DLQ with an x-death header
+func TestReplay(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			ctx := context.Background()
+			d, ch := connect(t)
+			source := testQueue(queueType)
+			dlq := deadLetter(t, ch, source, queueType, 5)
+			publish(t, ch, dlq, amqp.Publishing{MessageId: "orphan"})
+			waitForDepth(t, ch, dlq, 6)
+
+			if n, err := d.Depth(ctx, dlq); n != 6 || err != nil {
+				t.Fatalf("Depth() = %d, %v; want 6", n, err)
+			}
+
+			r, ok := d.(broker.Replayer)
+			if !ok {
+				t.Fatal("the RabbitMQ driver does not implement broker.Replayer")
+			}
+			replay := func(ctx context.Context, opts broker.ReplayOptions, wantErr error, want ...string) {
+				t.Helper()
+				var got []string
+				err := r.Replay(ctx, dlq, opts, func(r broker.Replayed) {
+					got = append(got, outcome(r))
+				})
+				if !errors.Is(err, wantErr) || !slices.Equal(got, want) {
+					t.Fatalf("Replay(%+v) = %q, %v; want %q, %v", opts, got, err, want, wantErr)
+				}
+			}
+
+			replay(ctx, broker.ReplayOptions{Limit: 2}, nil, "m0 → "+source, "m1 → "+source)
+			waitForDepth(t, ch, dlq, 4)
+
+			missing := source + ".missing"
+			unroutable := ` ✗ no queue named "` + missing + `"`
+			replay(ctx, broker.ReplayOptions{To: missing, Limit: 2}, nil, "m2 → "+missing+unroutable, "m3 → "+missing+unroutable)
+			waitForDepth(t, ch, dlq, 4)
+			if ids := peekIDs(t, d, dlq, 4); !slices.Equal(ids, []string{"m2", "m3", "m4", "orphan"}) {
+				t.Fatalf("%s holds %q after unroutable replays, want the original order", dlq, ids)
+			}
+
+			canceled, cancel := context.WithCancel(ctx)
+			err := r.Replay(canceled, dlq, broker.ReplayOptions{Limit: 4}, func(broker.Replayed) { cancel() })
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled Replay() err = %v, want context.Canceled", err)
+			}
+			waitForDepth(t, ch, dlq, 3)
+
+			replay(ctx, broker.ReplayOptions{Limit: 3}, nil, "m3 → "+source, "m4 → "+source, "orphan →  ✗ "+broker.ErrNoOrigin.Error())
+			waitForDepth(t, ch, dlq, 1)
+			waitForDepth(t, ch, source, 5)
+
+			replayed, err := d.Peek(ctx, source, 5)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, m := range replayed {
+				if m.ID != "m"+strconv.Itoa(i) || len(m.Deaths) != 0 || len(m.Headers) != 2 || m.Headers[replayCountHeader] != int64(1) {
+					t.Errorf("replayed message %d = %+v, want m%d with only limbo's headers and replayed once", i, m, i)
+				}
+			}
+		})
+	}
+}
+
+func outcome(r broker.Replayed) string {
+	s := r.Message.ID + " → " + r.To
+	if r.Err != nil {
+		s += " ✗ " + r.Err.Error()
+	}
+
+	return s
+}
+
+func peekIDs(t *testing.T, d broker.Driver, queue string, n int) []string {
+	t.Helper()
+	msgs, err := d.Peek(context.Background(), queue, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := make([]string, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+
+	return ids
+}
+
+// Requires a broker, e.g. LIMBO_TEST_AMQP_URL=amqp://guest:guest@localhost:5672/
+func connect(t *testing.T) (broker.Driver, *amqp.Channel) {
+	t.Helper()
+	rawURL := os.Getenv("LIMBO_TEST_AMQP_URL")
+	if rawURL == "" {
+		t.Skip("LIMBO_TEST_AMQP_URL is not set")
+	}
+	u, err := broker.ParseURL(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := Open(context.Background(), u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	conn, err := amqp.Dial(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return d, ch
+}
+
+func testQueue(queueType string) string {
+	return "limbo.test." + queueType + "." + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+// Rejects n messages from source so they land in its DLQ, in order and with an x-death header
 func deadLetter(t *testing.T, ch *amqp.Channel, source, queueType string, n int) string {
 	t.Helper()
 	dlq := source + ".dlq"
@@ -115,18 +262,32 @@ func deadLetter(t *testing.T, ch *amqp.Channel, source, queueType string, n int)
 		t.Cleanup(func() { _, _ = ch.QueueDelete(name, false, false, false) })
 	}
 	declare(dlq, amqp.Table{})
-	declare(source, amqp.Table{"x-message-ttl": 0, "x-dead-letter-exchange": "", "x-dead-letter-routing-key": dlq})
+	declare(source, amqp.Table{"x-dead-letter-exchange": "", "x-dead-letter-routing-key": dlq})
 
 	for i := range n {
-		msg := amqp.Publishing{MessageId: "m" + strconv.Itoa(i), Body: []byte(`{"n":` + strconv.Itoa(i) + `}`)}
-		if err := ch.PublishWithContext(context.Background(), "", source, false, false, msg); err != nil {
+		publish(t, ch, source, amqp.Publishing{MessageId: "m" + strconv.Itoa(i), Body: []byte(`{"n":` + strconv.Itoa(i) + `}`)})
+	}
+	waitForDepth(t, ch, source, n)
+
+	for range n {
+		d, ok, err := ch.Get(source, false)
+		if err != nil || !ok {
+			t.Fatalf("get from %s: ok %v, err %v", source, ok, err)
+		}
+		if err := d.Reject(false); err != nil {
 			t.Fatal(err)
 		}
 	}
-
 	waitForDepth(t, ch, dlq, n)
 
 	return dlq
+}
+
+func publish(t *testing.T, ch *amqp.Channel, queue string, msg amqp.Publishing) {
+	t.Helper()
+	if err := ch.PublishWithContext(context.Background(), "", queue, false, false, msg); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Quorum queues apply returns asynchronously, so depth settles shortly after a peek
@@ -139,22 +300,6 @@ func waitForDepth(t *testing.T, ch *amqp.Channel, queue string, n int) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-}
-
-func channel(t *testing.T, rawURL string) *amqp.Channel {
-	t.Helper()
-	conn, err := amqp.Dial(rawURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.Close() })
-
-	ch, err := conn.Channel()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return ch
 }
 
 func depth(t *testing.T, ch *amqp.Channel, queue string) int {
