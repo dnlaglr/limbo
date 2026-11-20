@@ -6,6 +6,7 @@ import (
 
 	"github.com/dnlaglr/limbo/internal/broker"
 	"github.com/dnlaglr/limbo/internal/broker/rabbitmq"
+	"github.com/dnlaglr/limbo/internal/broker/sqs"
 	"github.com/dnlaglr/limbo/internal/ui"
 )
 
@@ -26,7 +27,7 @@ func New(build BuildInfo, stdout, stderr io.Writer) *App {
 		Build:    build.resolve(),
 		UI:       ui.New(stdout, stderr),
 		Log:      slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})),
-		Brokers:  broker.Registry{"amqp": rabbitmq.Open, "amqps": rabbitmq.Open},
+		Brokers:  broker.Registry{"amqp": rabbitmq.Open, "amqps": rabbitmq.Open, "sqs": sqs.Open},
 		logLevel: level,
 	}
 }
