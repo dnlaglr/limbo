@@ -29,8 +29,8 @@ tasks:
     cmd: go run ./internal/ui/demo
   
   test:
-    desc: Run tests with the race detector
-    cmd: go test -race ./...
+    desc: Run tests with the race detector and report coverage
+    cmd: go test -race -cover $(go list -f '{{`{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}`}}' ./...)
 
   fmt:
     desc: Format code and tidy go.mod
