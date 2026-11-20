@@ -14,7 +14,7 @@ var ErrNoTerminal = errors.New("not a terminal")
 
 // The answer is read in a goroutine so Ctrl-C can cancel a prompt that is blocked on stdin
 func (u *UI) Confirm(ctx context.Context, in io.Reader, question string) (bool, error) {
-	if !u.live || !isTerminal(in) {
+	if !u.CanPrompt(in) {
 		return false, ErrNoTerminal
 	}
 
@@ -34,4 +34,8 @@ func (u *UI) Confirm(ctx context.Context, in io.Reader, question string) (bool, 
 		line = strings.ToLower(strings.TrimSpace(line))
 		return line == "y" || line == "yes", nil
 	}
+}
+
+func (u *UI) CanPrompt(in io.Reader) bool {
+	return u.live && isTerminal(in)
 }
