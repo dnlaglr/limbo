@@ -66,34 +66,17 @@ func (d *driver) Replay(ctx context.Context, queue string, opts broker.ReplayOpt
 	}
 	defer out.ch.Close()
 
-	matched := 0
+	run := opts.Start(each)
 	return d.scan(ctx, queue, opts.Scan, func(delivery *amqp.Delivery, ack func() error) (bool, error) {
-		r := broker.Replayed{Message: toMessage(queue, delivery)}
-		if !opts.Filter.Match(r.Message) {
-			r.Err = broker.ErrSkipped
-			each(r)
-			return true, nil
-		}
-
-		matched++
-		if r.To, r.Err = opts.Target(r.Message); r.Err == nil {
-			r.Err = out.publish(r.To, delivery)
-		}
-
-		var ackErr error
-		if r.Err == nil {
-			ackErr = ack()
-		}
-		each(r)
-
+		r, more, err := run.Next(toMessage(queue, delivery), func(to string) error { return out.publish(to, delivery) }, ack)
 		switch {
-		case ackErr != nil:
-			return false, ackErr
+		case err != nil || errors.Is(r.Err, broker.ErrSkipped):
+			return more, err
 		case out.ch.IsClosed() || errors.Is(r.Err, context.DeadlineExceeded):
 			return false, r.Err
 		}
 
-		return !opts.Full(matched), nil
+		return more, nil
 	})
 }
 
