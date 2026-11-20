@@ -13,17 +13,29 @@ import (
 )
 
 type fakeDriver struct {
-	msgs   []broker.Message
-	err    error
-	depths map[string]int
-	queue  string
-	limit  int
-	closed bool
+	msgs    []broker.Message
+	err     error
+	depths  map[string]int
+	queue   string
+	n       int
+	visited int
+	closed  bool
 }
 
-func (f *fakeDriver) Peek(_ context.Context, queue string, limit int) ([]broker.Message, error) {
-	f.queue, f.limit = queue, limit
-	return f.msgs, f.err
+func browsing(msgs ...broker.Message) *fakeDriver {
+	return &fakeDriver{msgs: msgs, depths: map[string]int{"orders.dlq": len(msgs)}}
+}
+
+func (f *fakeDriver) Browse(_ context.Context, queue string, n int, visit func(broker.Message) bool) error {
+	f.queue, f.n = queue, n
+	for _, m := range f.msgs[:min(n, len(f.msgs))] {
+		f.visited++
+		if !visit(m) {
+			break
+		}
+	}
+
+	return f.err
 }
 
 func (f *fakeDriver) Depth(_ context.Context, queue string) (int, error) {
@@ -60,18 +72,24 @@ var (
 			{Queue: "orders", Reason: "rejected", Count: 3, Time: rejectedAt, Exchange: "shop", RoutingKeys: []string{"order.created"}},
 		},
 	}
+
+	expiredPayment = broker.Message{
+		ID:     "9a0b1c2d",
+		Queue:  "orders.dlq",
+		Deaths: []broker.Death{{Queue: "payments", Reason: "expired", Count: 1, Time: rejectedAt.Add(-time.Hour)}},
+	}
 )
 
 func TestPeekText(t *testing.T) {
 	hostile := broker.Message{Queue: "orders.dlq", Body: []byte("\x1b]0;pwned\x07 hello")}
-	d := &fakeDriver{msgs: []broker.Message{rejectedOrder, hostile}}
+	d := browsing(rejectedOrder, hostile)
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "peek", "orders.dlq", "--url", "fake://guest:s3cret@localhost", "-n", "5")
 	if code != exitOK {
 		t.Fatalf("exit code = %d, stderr:\n%s", code, errOut)
 	}
-	if d.queue != "orders.dlq" || d.limit != 5 || !d.closed {
-		t.Errorf("driver got queue %q, limit %d, closed %v", d.queue, d.limit, d.closed)
+	if d.queue != "orders.dlq" || d.visited != 2 || !d.closed {
+		t.Errorf("driver got queue %q, visited %d, closed %v", d.queue, d.visited, d.closed)
 	}
 
 	for _, want := range []string{
@@ -104,7 +122,7 @@ func TestPeekText(t *testing.T) {
 
 func TestPeekJSON(t *testing.T) {
 	binary := broker.Message{Queue: "orders.dlq", Body: []byte{0xff, 0x00, 0x01}}
-	d := &fakeDriver{msgs: []broker.Message{rejectedOrder, binary}}
+	d := browsing(rejectedOrder, binary)
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "peek", "orders.dlq", "--url", "fake://localhost", "-o", "json")
 	if code != exitOK {
@@ -124,31 +142,54 @@ func TestPeekJSON(t *testing.T) {
 func TestPeekEmptyQueue(t *testing.T) {
 	t.Setenv("LIMBO_URL", "fake://localhost")
 
-	code, out, errOut := runWith(t, fakeBrokers(&fakeDriver{}), "peek", "orders.dlq")
+	code, out, errOut := runWith(t, fakeBrokers(browsing()), "peek", "orders.dlq")
 	if code != exitOK || out != "" || !strings.Contains(errOut, "orders.dlq is empty") {
 		t.Errorf("exit code %d, stdout %q, stderr %q; want an empty-queue note", code, out, errOut)
 	}
 }
 
+func TestPeekFiltered(t *testing.T) {
+	d := browsing(orphan, expiredPayment, rejectedOrder, rejectedOrder)
+
+	code, out, errOut := runWith(t, fakeBrokers(d), "peek", "orders.dlq", "--url", "fake://x", "--reason", "rejected", "--not-from", "payments", "-n", "1")
+	if code != exitOK {
+		t.Fatalf("exit code = %d, stderr:\n%s", code, errOut)
+	}
+	if d.n != 4 || d.visited != 3 {
+		t.Errorf("visited %d of up to %d messages, want to stop at the first match, the third of 4", d.visited, d.n)
+	}
+	if !strings.Contains(out, "orders.dlq  1/1") || !strings.Contains(out, rejectedOrder.ID) || strings.Contains(out, orphan.ID) {
+		t.Errorf("stdout shows the wrong messages:\n%s", out)
+	}
+	for _, want := range []string{"1 of 3 messages matched", "Put 3 messages back on orders.dlq"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr is missing %q:\n%s", want, errOut)
+		}
+	}
+}
+
 func TestPeekErrors(t *testing.T) {
 	tests := []struct {
-		name    string
-		args    []string
-		peekErr error
-		want    string
+		name      string
+		args      []string
+		browseErr error
+		want      string
 	}{
 		{"no url", nil, nil, "pass --url or set LIMBO_URL"},
 		{"unknown output", []string{"--url", "fake://x", "-o", "yaml"}, nil, `unknown output format "yaml"`},
 		{"bad limit", []string{"--url", "fake://x", "-n", "0"}, nil, "limit must be at least 1"},
 		{"unsupported scheme", []string{"--url", "kafka://x"}, nil, `unsupported broker URL scheme "kafka"`},
-		{"driver error", []string{"--url", "fake://x"}, errors.New(`queue "q" not found`), `queue "q" not found`},
+		{"driver error", []string{"--url", "fake://x"}, errors.New("channel closed"), "channel closed"},
+		{"bad regex", []string{"--url", "fake://x", "--body", "("}, nil, `invalid argument "(" for "--body" flag: error parsing regexp`},
+		{"bad age", []string{"--url", "fake://x", "--older-than", "3w"}, nil, "use a positive duration such as 30m, 2h or 7d"},
+		{"nameless header", []string{"--url", "fake://x", "--not-header", "=acme"}, nil, "name the header, as key or key=value"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("LIMBO_URL", "")
 
 			args := append([]string{"peek", "q"}, tt.args...)
-			code, _, errOut := runWith(t, fakeBrokers(&fakeDriver{err: tt.peekErr}), args...)
+			code, _, errOut := runWith(t, fakeBrokers(&fakeDriver{depths: map[string]int{"q": 1}, err: tt.browseErr}), args...)
 			if code != exitError || !strings.Contains(strings.ToLower(errOut), strings.ToLower(tt.want)) {
 				t.Errorf("exit code %d, stderr:\n%s\nwant exit %d and %q", code, errOut, exitError, tt.want)
 			}

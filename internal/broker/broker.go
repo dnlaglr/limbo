@@ -58,8 +58,26 @@ func (m Message) Origin() string {
 	return m.Deaths[0].Queue
 }
 
+func (m Message) Reason() string {
+	if len(m.Deaths) == 0 {
+		return ""
+	}
+
+	return m.Deaths[0].Reason
+}
+
+// Falls back to the publish time for messages the broker recorded no death for
+func (m Message) DiedAt() time.Time {
+	if len(m.Deaths) > 0 && !m.Deaths[0].Time.IsZero() {
+		return m.Deaths[0].Time
+	}
+
+	return m.Timestamp
+}
+
 type Driver interface {
-	Peek(ctx context.Context, queue string, limit int) ([]Message, error)
+	// Browse visits up to n messages in queue order without removing any and stops early when visit returns false
+	Browse(ctx context.Context, queue string, n int, visit func(Message) bool) error
 	Depth(ctx context.Context, queue string) (int, error)
 	Close() error
 }
@@ -70,8 +88,8 @@ type Replayer interface {
 }
 
 type ReplayOptions struct {
-	To    string
-	Limit int
+	Selection
+	To string
 }
 
 var ErrNoOrigin = errors.New("no dead-letter history, pass --to to choose a destination")

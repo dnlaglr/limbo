@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -43,7 +44,7 @@ func TestReplayText(t *testing.T) {
 	if code != exitError {
 		t.Fatalf("exit code = %d, want %d for a partial replay; stderr:\n%s", code, exitError, errOut)
 	}
-	if d.opts == nil || *d.opts != (broker.ReplayOptions{Limit: 4}) || d.queue != "orders.dlq" || !d.closed {
+	if d.opts == nil || !reflect.DeepEqual(*d.opts, broker.ReplayOptions{Selection: broker.Selection{Limit: 4, Scan: 4}}) || d.queue != "orders.dlq" || !d.closed {
 		t.Errorf("driver got queue %q, options %+v, closed %v", d.queue, d.opts, d.closed)
 	}
 
@@ -89,18 +90,46 @@ func TestReplayNeedsConfirmation(t *testing.T) {
 }
 
 func TestReplayDryRun(t *testing.T) {
-	d := replayer(2)
-	d.msgs = []broker.Message{rejectedOrder, orphan}
+	d := replayer(3)
+	d.msgs = []broker.Message{rejectedOrder, orphan, expiredPayment}
 
-	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--dry-run")
-	if code != exitOK || d.opts != nil || d.limit != 2 {
-		t.Fatalf("exit code %d, replayed %v, peeked %d; want a peek of 2 and no replay; stderr:\n%s", code, d.opts != nil, d.limit, errOut)
+	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--dry-run", "--not-reason", "expired")
+	if code != exitOK || d.opts != nil || d.n != 3 || d.visited != 3 {
+		t.Fatalf("exit code %d, replayed %v, read %d of %d; want a read of 3 and no replay; stderr:\n%s", code, d.opts != nil, d.visited, d.n, errOut)
 	}
 
-	for _, want := range []string{"orders.dlq  dry run", "Would replay", "orders ×1", "Would return", broker.ErrNoOrigin.Error() + " ×1"} {
+	for _, want := range []string{"orders.dlq  dry run", "Would replay", "orders ×1", "Would return", broker.ErrNoOrigin.Error() + " ×1", "Skipped", "1 message"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout is missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestReplayFiltered(t *testing.T) {
+	d := replayer(3,
+		broker.Replayed{Message: orphan, Err: broker.ErrSkipped},
+		broker.Replayed{Message: rejectedOrder, To: "orders"},
+		broker.Replayed{Message: expiredPayment, Err: broker.ErrSkipped},
+	)
+
+	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "-y", "--from", "orders", "-o", "json")
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d when messages were only skipped; stderr:\n%s", code, exitOK, errOut)
+	}
+	if d.visited != 0 || d.opts == nil || d.opts.Scan != 3 || d.opts.Limit != 0 || len(d.opts.Filter.Sources.Any) != 1 {
+		t.Errorf("read %d messages first and replayed with %+v; want one filtered pass over all 3", d.visited, d.opts)
+	}
+	if want := `{"id":"4f1c2a7e","to":"orders","status":"replayed"}` + "\n"; out != want {
+		t.Errorf("stdout =\n%s\nwant only the replayed message\n%s", out, want)
+	}
+}
+
+func TestReplayAllSkipped(t *testing.T) {
+	d := replayer(2, broker.Replayed{Message: orphan, Err: broker.ErrSkipped}, broker.Replayed{Message: expiredPayment, Err: broker.ErrSkipped})
+
+	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--yes", "--reason", "rejected")
+	if code != exitOK || !strings.Contains(out, "Skipped") || !strings.Contains(out, "2 messages") || strings.Contains(out, "Not reached") {
+		t.Errorf("exit code %d, stdout:\n%s\nwant exit 0 and 2 skipped messages; stderr:\n%s", code, out, errOut)
 	}
 }
 

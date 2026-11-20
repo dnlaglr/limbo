@@ -38,40 +38,10 @@ func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
 
 func (d *driver) Close() error { return d.conn.Close() }
 
-// Messages stay unacked until one multiple nack returns them all in order
-// Closing the channel instead would count as a failed delivery against a quorom queue's delivery limit
-func (d *driver) Peek(ctx context.Context, queue string, limit int) (msgs []broker.Message, err error) {
-	ch, err := d.conn.Channel()
-	if err != nil {
-		return nil, err
-	}
-	defer ch.Close()
-
-	var last uint64
-	defer func() {
-		if last > 0 {
-			err = errors.Join(err, ch.Nack(last, true, true))
-		}
-	}()
-
-	for len(msgs) < limit {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		delivery, ok, err := ch.Get(queue, false)
-		if err != nil {
-			return nil, queueError(queue, err)
-		}
-		if !ok {
-			break
-		}
-
-		last = delivery.DeliveryTag
-		msgs = append(msgs, toMessage(queue, &delivery))
-	}
-
-	return msgs, nil
+func (d *driver) Browse(ctx context.Context, queue string, n int, visit func(broker.Message) bool) error {
+	return d.scan(ctx, queue, n, func(delivery *amqp.Delivery, _ func() error) (bool, error) {
+		return visit(toMessage(queue, delivery)), nil
+	})
 }
 
 func (d *driver) Depth(_ context.Context, queue string) (int, error) {
@@ -89,61 +59,105 @@ func (d *driver) Depth(_ context.Context, queue string) (int, error) {
 	return q.Messages, nil
 }
 
-func (d *driver) Replay(ctx context.Context, queue string, opts broker.ReplayOptions, each func(broker.Replayed)) (err error) {
-	in, err := d.conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
+func (d *driver) Replay(ctx context.Context, queue string, opts broker.ReplayOptions, each func(broker.Replayed)) error {
 	out, err := d.publisher()
 	if err != nil {
 		return err
 	}
 	defer out.ch.Close()
 
-	var held uint64
-	defer func() {
-		if held > 0 && !in.IsClosed() {
-			err = errors.Join(err, in.Nack(held, true, true))
-		}
-	}()
-
-	for range opts.Limit {
-		if err := ctx.Err(); err != nil {
-			return err
+	matched := 0
+	return d.scan(ctx, queue, opts.Scan, func(delivery *amqp.Delivery, ack func() error) (bool, error) {
+		r := broker.Replayed{Message: toMessage(queue, delivery)}
+		if !opts.Filter.Match(r.Message) {
+			r.Err = broker.ErrSkipped
+			each(r)
+			return true, nil
 		}
 
-		delivery, ok, err := in.Get(queue, false)
-		if err != nil {
-			return queueError(queue, err)
-		}
-		if !ok {
-			return nil
-		}
-
-		r := broker.Replayed{Message: toMessage(queue, &delivery)}
+		matched++
 		if r.To, r.Err = opts.Target(r.Message); r.Err == nil {
-			r.Err = out.publish(r.To, &delivery)
+			r.Err = out.publish(r.To, delivery)
 		}
 
 		var ackErr error
 		if r.Err == nil {
-			ackErr = in.Ack(delivery.DeliveryTag, false)
-		} else {
-			held = delivery.DeliveryTag
+			ackErr = ack()
 		}
 		each(r)
 
 		switch {
 		case ackErr != nil:
-			return ackErr
+			return false, ackErr
 		case out.ch.IsClosed() || errors.Is(r.Err, context.DeadlineExceeded):
-			return r.Err
+			return false, r.Err
+		}
+
+		return !opts.Full(matched), nil
+	})
+}
+
+// Deliveries visit doesn't ack stay unacked until one multiple nack returns them all in order
+// Closing the channel instead would count as a failed delivery against a quorum queue's delivery limit
+// TODO: One basic.get round trip per message, a prefetching consumer is the upgrade if big scans get too slow
+func (d *driver) scan(ctx context.Context, queue string, n int, visit func(*amqp.Delivery, func() error) (bool, error)) (err error) {
+	ch, err := d.conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	var held uint64
+	defer func() {
+		if held > 0 && !ch.IsClosed() {
+			err = errors.Join(err, ch.Nack(held, true, true))
+		}
+	}()
+
+	var stopped error
+	visiting, inRequeued := true, false
+	for range n {
+		if visiting && ctx.Err() != nil {
+			visiting, stopped = false, ctx.Err()
+		}
+		if !visiting && (!inRequeued || ch.IsClosed()) {
+			return stopped
+		}
+
+		delivery, ok, err := ch.Get(queue, false)
+		if err != nil {
+			return errors.Join(stopped, queueError(queue, err))
+		}
+		if !ok {
+			return stopped
+		}
+
+		inRequeued = requeued(&delivery)
+		if !visiting {
+			held = delivery.DeliveryTag
+			continue
+		}
+
+		acked := false
+		more, err := visit(&delivery, func() error {
+			acked = true
+			return ch.Ack(delivery.DeliveryTag, false)
+		})
+		if !acked {
+			held = delivery.DeliveryTag
+		}
+		if err != nil || !more {
+			visiting, stopped = false, err
 		}
 	}
 
-	return nil
+	return stopped
+}
+
+// Quorum queues serve requeued messages first and in the order they came back, so a scan that stops among them holds the rest too, or its nack would put what it read behind them
+// They carry x-acquired-count from RabbitMQ 4.3 and x-delivery-count before it, classic queues requeue in place and set neither
+func requeued(d *amqp.Delivery) bool {
+	return d.Redelivered && (d.Headers["x-acquired-count"] != nil || d.Headers["x-delivery-count"] != nil)
 }
 
 type publisher struct {
