@@ -24,7 +24,10 @@ import (
 	"github.com/dnlaglr/limbo/internal/ui"
 )
 
-const maxBodyPreview = 1024
+const (
+	maxBodyPreview = 1024
+	urlUsage       = "broker URL such as amqp://user:pass@host:5672/vhost (default $LIMBO_URL)"
+)
 
 type peekOptions struct {
 	url    string
@@ -57,7 +60,7 @@ RabbitMQ 4.3 count each peek toward their delivery limit.`,
 	}
 
 	flags := cmd.Flags()
-	flags.StringVar(&opts.url, "url", "", "broker URL such as amqp://user:pass@host:5672/vhost (default $LIMBO_URL)")
+	flags.StringVar(&opts.url, "url", "", urlUsage)
 	flags.IntVarP(&opts.limit, "limit", "n", 10, "maximum number of messages to show")
 	flags.StringVarP(&opts.output, "output", "o", "text", "output format: text or json")
 
@@ -78,11 +81,7 @@ func runPeek(ctx context.Context, a *app.App, queue string, opts peekOptions) er
 		return err
 	}
 
-	var d broker.Driver
-	err = a.UI.Step(ctx, "Connecting to "+u.Redacted(), func(ctx context.Context) (err error) {
-		d, err = a.Brokers.Open(ctx, u)
-		return err
-	})
+	d, err := connect(ctx, a, u)
 	if err != nil {
 		return err
 	}
@@ -118,6 +117,15 @@ func brokerURL(flag string) (*url.URL, error) {
 	}
 
 	return broker.ParseURL(raw)
+}
+
+func connect(ctx context.Context, a *app.App, u *url.URL) (d broker.Driver, err error) {
+	err = a.UI.Step(ctx, "Connecting to "+u.Redacted(), func(ctx context.Context) (err error) {
+		d, err = a.Brokers.Open(ctx, u)
+		return err
+	})
+
+	return d, err
 }
 
 func warnDeliveries(a *app.App, queue string, msgs []broker.Message) {
