@@ -26,7 +26,7 @@ import (
 
 const (
 	maxBodyPreview = 1024
-	urlUsage       = "broker URL such as amqp://user:pass@host:5672/vhost (default $LIMBO_URL)"
+	urlUsage       = "broker URL such as amqp://user:pass@host:5672/vhost or sqs://us-east-1 (default $LIMBO_URL)"
 )
 
 type peekOptions struct {
@@ -49,14 +49,13 @@ func newPeekCmd(a *app.App) *cobra.Command {
 		Short: "Show dead-lettered messages without consuming them",
 		Long: `Peek shows the messages waiting in a dead-letter queue and leaves them there.
 
-Limbo holds every message it reads until it is done, then returns them all to the queue in their original order. It
-reads until it has --limit messages that match, or until it reaches the end of the queue as counted when it started.
-Brokers may record each read as a delivery: RabbitMQ marks the messages as redelivered, and quorum queues before
-RabbitMQ 4.3 count each peek toward their delivery limit.
-
+Limbo holds every message it reads until it is done, then returns them all to the queue, in their original order where the broker keeps one. 
+It reads until it has --limit messages that match, or until it reaches the end of the queue as counted when it started.
+` + readHelp + `
 ` + filterHelp,
 		Example: `  limbo peek orders.dlq --url amqp://guest:guest@localhost:5672/
   limbo peek orders.dlq --reason rejected --from orders --newer-than 1h
+	limbo peek orders-dlq.fifo --url sqs://eu-west-1 --header MessageGroupId=acme
   LIMBO_URL=amqps://user:pass@broker:5671/prod limbo peek orders.dlq -n 50 -o json | jq .body`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

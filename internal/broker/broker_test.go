@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"strings"
 	"testing"
@@ -47,6 +48,58 @@ func TestRegistryOpen(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "s3cret") {
 				t.Errorf("err leaks the password: %v", err)
+			}
+		})
+	}
+}
+
+func TestReplayRun(t *testing.T) {
+	died := func(id, queue string) Message { return Message{ID: id, Deaths: []Death{{Queue: queue}}} }
+	refused, errRemove := errors.New("refused"), errors.New("remove failed")
+
+	type step struct {
+		m                  Message
+		sendErr, removeErr error
+		want               string
+		sent, removed      bool
+		more               bool
+		err                error
+	}
+	tests := []struct {
+		name  string
+		limit int
+		steps []step
+	}{
+		{"filtered", 3, []step{
+			{m: died("p", "payments"), want: "p →  ✗ " + ErrSkipped.Error(), more: true},
+			{m: Message{ID: "o"}, want: "o →  ✗ " + ErrNoOrigin.Error(), more: true},
+			{m: died("a", "orders"), sendErr: refused, want: "a → orders ✗ refused", sent: true, more: true},
+			{m: died("b", "orders"), removeErr: errRemove, want: "b → orders", sent: true, removed: true, err: errRemove},
+		}},
+		{"limit", 1, []step{
+			{m: died("c", "orders"), want: "c → orders", sent: true, removed: true},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got string
+			opts := ReplayOptions{Selection: Selection{Filter: Filter{Sources: Rule[string]{None: []string{"payments"}}}, Limit: tt.limit}}
+			run := opts.Start(func(r Replayed) {
+				got = r.Message.ID + " → " + r.To
+				if r.Err != nil {
+					got += " ✗ " + r.Err.Error()
+				}
+			})
+
+			for _, s := range tt.steps {
+				sent, removed := false, false
+				_, more, err := run.Next(s.m,
+					func(string) error { sent = true; return s.sendErr },
+					func() error { removed = true; return s.removeErr })
+				if got != s.want || sent != s.sent || removed != s.removed || more != s.more || !errors.Is(err, s.err) {
+					t.Errorf("Next(%s) reported %q, sent %v, removed %v, more %v, err %v; want %q, %v, %v, %v, %v",
+						s.m.ID, got, sent, removed, more, err, s.want, s.sent, s.removed, s.more, s.err)
+				}
 			}
 		})
 	}

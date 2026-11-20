@@ -66,7 +66,7 @@ func (m Message) Reason() string {
 	return m.Deaths[0].Reason
 }
 
-// Falls back to the publish time for messages the broker recorded no death for
+// Falls back to the publish time when the broker records no death time
 func (m Message) DiedAt() time.Time {
 	if len(m.Deaths) > 0 && !m.Deaths[0].Time.IsZero() {
 		return m.Deaths[0].Time
@@ -76,8 +76,9 @@ func (m Message) DiedAt() time.Time {
 }
 
 type Driver interface {
-	// Browse visits up to n messages in queue order without removing any and stops early when visit returns false
+	// Browse visits up to n messages without removing any, in delivery order where the broker keeps one, and stops early when visit returns false or the broker hands out no more
 	Browse(ctx context.Context, queue string, n int, visit func(Message) bool) error
+	// Depth may be approximate
 	Depth(ctx context.Context, queue string) (int, error)
 	Close() error
 }
@@ -107,6 +108,40 @@ type Replayed struct {
 	Message Message
 	To      string
 	Err     error
+}
+
+type ReplayRun struct {
+	opts    ReplayOptions
+	each    func(Replayed)
+	matched int
+}
+
+func (o ReplayOptions) Start(each func(Replayed)) *ReplayRun {
+	return &ReplayRun{opts: o, each: each}
+}
+
+// A message is removed only after send succeeds, and a failed remove ends the run because the message is then in both queues
+func (r *ReplayRun) Next(m Message, send func(to string) error, remove func() error) (Replayed, bool, error) {
+	res := Replayed{Message: m}
+	if !r.opts.Filter.Match(m) {
+		res.Err = ErrSkipped
+		r.each(res)
+
+		return res, true, nil
+	}
+
+	r.matched++
+	if res.To, res.Err = r.opts.Target(m); res.Err == nil {
+		res.Err = send(res.To)
+	}
+
+	var err error
+	if res.Err == nil {
+		err = remove()
+	}
+	r.each(res)
+
+	return res, err == nil && !r.opts.Full(r.matched), err
 }
 
 type Opener func(ctx context.Context, u *url.URL) (Driver, error)

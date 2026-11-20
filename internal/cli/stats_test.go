@@ -58,3 +58,21 @@ func TestStatsInterrupted(t *testing.T) {
 		t.Errorf("exit code %d, stdout:\n%s\nstderr:\n%s\nwant exit %d with partial counts", code, out, errOut, exitCanceled)
 	}
 }
+
+func TestShortRead(t *testing.T) {
+	heldBack := func() *fakeDriver {
+		d := browsing(rejectedOrder, expiredPayment)
+		d.depths["orders.dlq"] = 3
+		return d
+	}
+
+	code, _, errOut := runWith(t, fakeBrokers(heldBack()), "peek", "orders.dlq", "--url", "fake://x")
+	if code != exitOK || !strings.Contains(errOut, "Read only 2 of the 3 messages counted in orders.dlq") {
+		t.Errorf("peek exit code %d, stderr:\n%s\nwant a warning that it read fewer than it counted", code, errOut)
+	}
+
+	code, out, errOut := runWith(t, fakeBrokers(heldBack()), "stats", "orders.dlq", "--url", "fake://x", "-o", "json")
+	if code != exitOK || !strings.Contains(out, `"scanned":2,"matched":2,"partial":true`) {
+		t.Errorf("stats exit code %d, stdout:\n%s\nstderr:\n%s\nwant partial counts", code, out, errOut)
+	}
+}
