@@ -46,12 +46,10 @@ func newStatsCmd(a *app.App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stats <queue>",
 		Short: "Summarize a dead-letter queue without consuming it",
-		Long: `Stats reads every message in a dead-letter queue, as counted when it starts, and puts them all back in their
-original order. It reports how many messages there are, when the oldest and newest died, and why they died.
-
-Reading a message may count as a delivery: RabbitMQ marks it as redelivered, and quorum queues before RabbitMQ 4.3
-count each read toward their delivery limit. Press Ctrl-C to stop early and see the counts so far.
-
+		Long: `Stats reads every message in a dead-letter queue, as counted when it starts, and puts them all back, in their original
+order where the broker keeps one. It reports how many messages there are, when the oldest and newest died, and why they died. 
+Press Ctrl-C to stop early and see the counts so far.
+` + readHelp + `
 ` + filterHelp,
 		Example: `  limbo stats orders.dlq
   limbo stats orders.dlq --from orders --newer-than 1h -o json | jq .reasons`,
@@ -94,15 +92,16 @@ func runStats(ctx context.Context, a *app.App, queue string, opts statsOptions) 
 	sel := broker.Selection{Filter: opts.filter.build(time.Now()), Scan: depth}
 	s := &queueStats{Queue: queue, Depth: depth, Reasons: map[string]int{}, filtered: !sel.Filter.IsZero()}
 	s.Scanned, err = browse(ctx, a, d, queue, sel, s.add)
-	s.Partial = err != nil
+	s.Partial = err != nil || s.Scanned < depth
 
 	if renderErr := render(a, s); renderErr != nil {
 		return renderErr
 	}
 	warnDeliveries(a, queue, s.deliveries)
-	if s.Partial {
+	switch {
+	case err != nil:
 		a.UI.Warn(fmt.Sprintf("Stopped after reading %d of %s, so these counts are partial", s.Scanned, countMessages(depth)))
-	} else if s.Scanned > 0 {
+	case s.Scanned > 0:
 		a.UI.Success("Put " + countMessages(s.Scanned) + " back on " + queue)
 	}
 

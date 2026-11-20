@@ -63,15 +63,21 @@ func newReplayCmd(a *app.App) *cobra.Command {
 Messages with no dead-letter history stay where they are unless you pass --to.
 
 A message leaves the dead-letter queue only after the broker confirms its copy reached the destination, and anything
-limbo cannot replay or skips goes back in its original order. Nothing is lost, but if the connection drops between the
-confirm and the acknowledgement, the message ends up in both queues, so consumers should tolerate duplicates.
+limbo cannot replay or skips goes back, in its original order where the broker keeps one. Nothing is lost, but if the
+connection drops between the confirm and the acknowledgement, the message ends up in both queues, so consumers should
+tolerate duplicates.
 
 On RabbitMQ, replayed messages drop the broker's x-death, x-first-death-*, x-last-death-*, x-delivery-count and
 x-acquired-count headers and carry x-limbo-replay-count and x-limbo-replayed-at instead.
 
+On SQS, replayed copies keep the body, message attributes and message group, and carry x-limbo-replay-count and
+x-limbo-replayed-at unless that would pass the limit of 10 attributes. Copies sent to a FIFO queue use limbo- followed
+by the dead-letter copy's message ID as their deduplication ID.
+
 Limbo asks before it replays. Pass --yes to skip the question, which is required without a terminal, or --dry-run to
 see where each message would go without moving anything. With filters, limbo reads the queue once to count the
-matches before it asks, and then replays no more than the messages it counted.
+matches before it asks, and then replays no more than the messages it counted. SQS standard queues hand out messages
+in no fixed order, so a replay with --limit may pick other matching messages than the dry run listed.
 
 ` + filterHelp,
 		Example: `  limbo replay orders.dlq --dry-run

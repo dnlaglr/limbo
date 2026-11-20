@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,9 +15,15 @@ import (
 	"github.com/dnlaglr/limbo/internal/broker"
 )
 
-const filterHelp = `Filters pick messages by their last death, headers, body and age. Different filters must all match, a filter
-given more than once matches any of its values, and --not-* filters skip every message they match. Age is the time of
-the last death, or the publish time for messages without dead-letter history.`
+const (
+	filterHelp = `Filters pick messages by their last death, headers, body and age. 
+Different filters must all match, a filter given more than once matches any of its values, and --not-* filters skip every message they match. 
+Age is the time of the last death, or the publish time when the broker records no death time, as on SQS.`
+	readHelp = `Brokers may record each read as a delivery. RabbitMQ marks the messages as redelivered, and quorum queues before
+RabbitMQ 4.3 count each read toward their delivery limit. SQS adds each read to a message's receive count and hides
+the message from other consumers until limbo returns it, or for up to 5 minutes if limbo is killed. SQS FIFO queues
+hand out only the first 10 messages of each message group while limbo holds them.`
+)
 
 type filterOptions struct {
 	filter    broker.Filter
@@ -26,7 +33,7 @@ type filterOptions struct {
 
 func addFilterFlags(cmd *cobra.Command, o *filterOptions) {
 	f, flags := &o.filter, cmd.Flags()
-	flags.StringArrayVar(&f.Reasons.Any, "reason", nil, "only messages whose last death had this reason, such as rejected, expired or maxlen")
+	flags.StringArrayVar(&f.Reasons.Any, "reason", nil, "only messages whose last death had this reason, such as rejected, expired, maxlen or delivery_limit")
 	flags.StringArrayVar(&f.Reasons.None, "not-reason", nil, "skip messages whose last death had this reason")
 	flags.StringArrayVar(&f.Sources.Any, "from", nil, "only messages that last died in this queue")
 	flags.StringArrayVar(&f.Sources.None, "not-from", nil, "skip messages that last died in this queue")
@@ -84,6 +91,10 @@ func browse(ctx context.Context, a *app.App, d broker.Driver, queue string, sel 
 			return !sel.Full(matched)
 		})
 	})
+	if err == nil && scanned < sel.Scan && !sel.Full(matched) {
+		a.UI.Warn(fmt.Sprintf("Read only %d of the %s counted in %s. Other consumers may have taken the rest, or the broker held "+
+			"them back, as SQS FIFO queues do past 10 messages per group.", scanned, countMessages(sel.Scan), queue))
+	}
 
 	return scanned, err
 }
