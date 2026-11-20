@@ -27,7 +27,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	flags.BoolVarP(&s.Quiet, "quiet", "q", false, "only print results and errors")
 	flags.VarPF(new(noColor), "no-color", "", "disable colored output (same as NO_COLOR=1)").NoOptDefVal = "true"
 
-	root.AddCommand(newVersionCmd(a), newPeekCmd(a), newReplayCmd(a))
+	root.AddCommand(newVersionCmd(a), newPeekCmd(a), newReplayCmd(a), newStatsCmd(a))
 
 	return root
 }
