@@ -35,6 +35,7 @@ var (
 	failureMark = negativeStyle.Render("✗")
 	warningMark = warningStyle.Render("!")
 	infoMark    = accentStyle.Render("•")
+	promptMark  = accentStyle.Render("?")
 )
 
 func Positive(s string) string { return positiveStyle.Render(s) }

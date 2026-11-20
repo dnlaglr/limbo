@@ -31,7 +31,7 @@ func (u *UI) narrate(line string) {
 	}
 }
 
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(interface{ Fd() uintptr })
+func isTerminal(stream any) bool {
+	f, ok := stream.(interface{ Fd() uintptr })
 	return ok && term.IsTerminal(f.Fd())
 }
