@@ -311,7 +311,7 @@ func (d *driver) release(ctx context.Context, addr string, held map[string]strin
 		cause = cmp.Or(cause, err)
 	}
 	if failed > 0 {
-		return fmt.Errorf("could not return %d messages, SQS shows them again within %d minutes: %w", failed, int(holdTimeout.Minutes()), cause)
+		return fmt.Errorf("could not return %d of the held messages, SQS shows them again within %d minutes: %w", failed, int(holdTimeout.Minutes()), cause)
 	}
 
 	return nil

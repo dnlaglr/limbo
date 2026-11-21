@@ -16,13 +16,13 @@ import (
 )
 
 const (
-	filterHelp = `Filters pick messages by their last death, headers, body and age. 
-Different filters must all match, a filter given more than once matches any of its values, and --not-* filters skip every message they match. 
-Age is the time of the last death, or the publish time when the broker records no death time, as on SQS.`
+	filterHelp = `Filters pick messages by their last death, headers, body and age. Different filters must all match, a filter given
+more than once matches any of its values, and --not-* filters skip every message they match. Age is the time of the
+last death, or the publish time when the broker records no death time, as on SQS.`
 	readHelp = `Brokers may record each read as a delivery. RabbitMQ marks the messages as redelivered, and quorum queues before
 RabbitMQ 4.3 count each read toward their delivery limit. SQS adds each read to a message's receive count and hides
 the message from other consumers until limbo returns it, or for up to 5 minutes if limbo is killed. SQS FIFO queues
-hand out only the first 10 messages of each message group while limbo holds them.`
+hand out at most the first 10 messages of each message group while limbo holds them.`
 )
 
 type filterOptions struct {
