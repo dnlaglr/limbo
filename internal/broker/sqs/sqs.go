@@ -3,6 +3,7 @@ package sqs
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"maps"
@@ -265,14 +266,20 @@ func (d *driver) receive(ctx context.Context, addr string, n int) ([]types.Messa
 	ctx, cancel := settle(ctx)
 	defer cancel()
 
-	out, err := d.client.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
+	in := &awssqs.ReceiveMessageInput{
 		QueueUrl:                    &addr,
 		MaxNumberOfMessages:         int32(n),
 		VisibilityTimeout:           int32(holdTimeout / time.Second),
 		WaitTimeSeconds:             pollWait,
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		MessageAttributeNames:       []string{"All"},
-	})
+	}
+	// The SDK resends the same attempt ID when it retries, so FIFO queues return a batch whose response was lost instead of hiding it
+	if strings.HasSuffix(addr, ".fifo") {
+		in.ReceiveRequestAttemptId = aws.String(rand.Text())
+	}
+
+	out, err := d.client.ReceiveMessage(ctx, in)
 	if err != nil {
 		return nil, err
 	}
