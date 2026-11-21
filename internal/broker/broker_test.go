@@ -28,6 +28,10 @@ func TestRegistryOpen(t *testing.T) {
 		{raw: "redis://localhost:6379", wantErr: `unsupported broker URL scheme "redis" (use amqp://, amqps://)`},
 		{raw: "localhost:5672", wantErr: `unsupported broker URL scheme "localhost"`},
 		{raw: "amqp://user:s3cret@[::1", wantErr: "invalid broker URL"},
+		{raw: "amqp://user:s3cret/x@localhost:5672/", wantErr: "percent-encode"},
+		{raw: "amqp://user:s3cret?x@localhost:5672/", wantErr: "percent-encode"},
+		{raw: "amqp://user:s3cret#x@localhost:5672/", wantErr: "percent-encode"},
+		{raw: "amqp://[::1", wantErr: `invalid broker URL: missing ']' in host`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.raw, func(t *testing.T) {

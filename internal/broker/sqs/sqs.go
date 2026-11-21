@@ -82,7 +82,15 @@ func parseURL(u *url.URL) (endpoint string, err error) {
 		}
 	}
 
-	return query.Get("endpoint"), nil
+	endpoint = query.Get("endpoint")
+	if endpoint == "" {
+		return "", nil
+	}
+	if e, err := url.Parse(endpoint); err != nil || e.User != nil || e.Host == "" || e.Scheme != "http" && e.Scheme != "https" {
+		return "", errors.New("endpoint must be a URL such as http://localhost:9324, without credentials")
+	}
+
+	return endpoint, nil
 }
 
 func (d *driver) Close() error { return nil }

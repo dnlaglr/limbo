@@ -133,7 +133,7 @@ func brokerURL(flag string) (*url.URL, error) {
 }
 
 func connect(ctx context.Context, a *app.App, u *url.URL) (d broker.Driver, err error) {
-	err = a.UI.Step(ctx, "Connecting to "+u.Redacted(), func(ctx context.Context) (err error) {
+	err = a.UI.Step(ctx, "Connecting to "+u.Scheme+"://"+u.Host+u.EscapedPath(), func(ctx context.Context) (err error) {
 		d, err = a.Brokers.Open(ctx, u)
 		return err
 	})

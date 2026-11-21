@@ -110,7 +110,7 @@ func TestPeekText(t *testing.T) {
 		t.Errorf("stdout passes control characters from a message through: %q", out)
 	}
 
-	for _, want := range []string{"fake://guest:xxxxx@localhost", "up to 18 times", "Put 2 messages back on orders.dlq"} {
+	for _, want := range []string{"Connecting to fake://localhost", "up to 18 times", "Put 2 messages back on orders.dlq"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("stderr is missing %q:\n%s", want, errOut)
 		}
@@ -192,6 +192,22 @@ func TestPeekErrors(t *testing.T) {
 			code, _, errOut := runWith(t, fakeBrokers(&fakeDriver{depths: map[string]int{"q": 1}, err: tt.browseErr}), args...)
 			if code != exitError || !strings.Contains(strings.ToLower(errOut), strings.ToLower(tt.want)) {
 				t.Errorf("exit code %d, stderr:\n%s\nwant exit %d and %q", code, errOut, exitError, tt.want)
+			}
+		})
+	}
+}
+
+func TestConnectHidesSecrets(t *testing.T) {
+	tests := []struct{ url, want string }{
+		{"fake://user:s3cret@host:1/vh?endpoint=http://k:s3cret@e", "Connecting to fake://host:1/vh"},
+		{"fake://u:s3cret@host:5672/%2F", "Connecting to fake://host:5672/%2F"},
+		{"fake://?endpoint=http://k:s3cret@e", "Connecting to fake://"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			_, _, errOut := runWith(t, fakeBrokers(&fakeDriver{depths: map[string]int{"q": 0}}), "peek", "q", "--url", tt.url)
+			if !strings.Contains(errOut, tt.want) || strings.Contains(errOut, "s3cret") || strings.Contains(errOut, "endpoint") {
+				t.Errorf("stderr:\n%s\nwant %q and no secret or query", errOut, tt.want)
 			}
 		})
 	}

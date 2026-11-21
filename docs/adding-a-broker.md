@@ -105,8 +105,7 @@ func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
 
 Keep secrets out of the output:
 
-- The CLI prints the URL with `u.Redacted()`, which hides only the password in the user info. Don't accept secrets
-  anywhere else in the URL.
+- The CLI prints only the scheme, host and path of the URL. Don't accept secrets in the host or path.
 - Don't put the raw URL in an error.
 - If the broker's SDK has a credential chain, such as AWS, Azure or Google Cloud, reject user info and load credentials
   from the chain. The SQS driver shows how.
