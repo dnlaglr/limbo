@@ -3,6 +3,7 @@ package sqs
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"maps"
@@ -82,7 +83,15 @@ func parseURL(u *url.URL) (endpoint string, err error) {
 		}
 	}
 
-	return query.Get("endpoint"), nil
+	endpoint = query.Get("endpoint")
+	if endpoint == "" {
+		return "", nil
+	}
+	if e, err := url.Parse(endpoint); err != nil || e.User != nil || e.Host == "" || e.Scheme != "http" && e.Scheme != "https" {
+		return "", errors.New("endpoint must be a URL such as http://localhost:9324, without credentials")
+	}
+
+	return endpoint, nil
 }
 
 func (d *driver) Close() error { return nil }
@@ -257,14 +266,20 @@ func (d *driver) receive(ctx context.Context, addr string, n int) ([]types.Messa
 	ctx, cancel := settle(ctx)
 	defer cancel()
 
-	out, err := d.client.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
+	in := &awssqs.ReceiveMessageInput{
 		QueueUrl:                    &addr,
 		MaxNumberOfMessages:         int32(n),
 		VisibilityTimeout:           int32(holdTimeout / time.Second),
 		WaitTimeSeconds:             pollWait,
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 		MessageAttributeNames:       []string{"All"},
-	})
+	}
+	// The SDK resends the same attempt ID when it retries, so FIFO queues return a batch whose response was lost instead of hiding it
+	if strings.HasSuffix(addr, ".fifo") {
+		in.ReceiveRequestAttemptId = aws.String(rand.Text())
+	}
+
+	out, err := d.client.ReceiveMessage(ctx, in)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +311,7 @@ func (d *driver) release(ctx context.Context, addr string, held map[string]strin
 		cause = cmp.Or(cause, err)
 	}
 	if failed > 0 {
-		return fmt.Errorf("could not return %d messages, SQS shows them again within %d minutes: %w", failed, int(holdTimeout.Minutes()), cause)
+		return fmt.Errorf("could not return %d of the held messages, SQS shows them again within %d minutes: %w", failed, int(holdTimeout.Minutes()), cause)
 	}
 
 	return nil

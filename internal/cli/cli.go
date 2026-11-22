@@ -40,10 +40,25 @@ func Execute(ctx context.Context, a *app.App, args []string) int {
 }
 
 func handleError(w io.Writer, styles fang.Styles, err error) {
-	if errors.Is(err, context.Canceled) {
-		return
+	if err = withoutCancel(err); err != nil {
+		fang.DefaultErrorHandler(w, styles, err)
 	}
-	fang.DefaultErrorHandler(w, styles, err)
+}
+
+// Ctrl-C needs no message, but an error limbo joined onto it, such as messages a broker could not return, still does
+func withoutCancel(err error) error {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var rest []error
+		for _, e := range joined.Unwrap() {
+			rest = append(rest, withoutCancel(e))
+		}
+		return errors.Join(rest...)
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+
+	return err
 }
 
 func colorScheme(c lipgloss.LightDarkFunc) fang.ColorScheme {

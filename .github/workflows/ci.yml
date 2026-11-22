@@ -45,3 +45,34 @@ jobs:
       - uses: go-task/setup-task@v2
       - run: task test
       - run: task build
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4.4
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s --health-timeout 10s --health-retries 20
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.7.1
+        ports: ["9324:9324"]
+        options: >-
+          --health-cmd "nc -z localhost 9324"
+          --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      LIMBO_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+      LIMBO_TEST_SQS_URL: sqs://us-east-1?endpoint=http://localhost:9324
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run integration tests
+        shell: bash
+        run: |
+          go test -race -count=1 -v ./internal/broker/... | tee integration.log
+          if grep -A1 -- '--- SKIP' integration.log; then exit 1; fi

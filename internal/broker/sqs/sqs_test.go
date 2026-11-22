@@ -33,6 +33,8 @@ func TestOpenRejects(t *testing.T) {
 		{"sqs://localhost:9324", "takes no port, pass ?endpoint="},
 		{"sqs://us-east-1/queues/orders", "use sqs://<region>"},
 		{"sqs://us-east-1?endpont=http://x", `unknown SQS URL option "endpont"`},
+		{"sqs://us-east-1?endpoint=http://AKIA:s3cret@localhost:9324", "without credentials"},
+		{"sqs://us-east-1?endpoint=localhost:9324", "endpoint must be a URL such as http://localhost:9324"},
 		{"sqs://", "no AWS region: use sqs://<region> or set AWS_REGION"},
 	}
 	for _, tt := range tests {

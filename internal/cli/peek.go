@@ -49,13 +49,16 @@ func newPeekCmd(a *app.App) *cobra.Command {
 		Short: "Show dead-lettered messages without consuming them",
 		Long: `Peek shows the messages waiting in a dead-letter queue and leaves them there.
 
-Limbo holds every message it reads until it is done, then returns them all to the queue, in their original order where the broker keeps one. 
-It reads until it has --limit messages that match, or until it reaches the end of the queue as counted when it started.
+Limbo holds every message it reads until it is done, then returns them all to the queue, in their original order where
+the broker keeps one. It reads until it has --limit messages that match, or until it reaches the end of the queue as
+counted when it started.
+
 ` + readHelp + `
+
 ` + filterHelp,
 		Example: `  limbo peek orders.dlq --url amqp://guest:guest@localhost:5672/
   limbo peek orders.dlq --reason rejected --from orders --newer-than 1h
-	limbo peek orders-dlq.fifo --url sqs://eu-west-1 --header MessageGroupId=acme
+  limbo peek orders-dlq.fifo --url sqs://eu-west-1 --header MessageGroupId=acme
   LIMBO_URL=amqps://user:pass@broker:5671/prod limbo peek orders.dlq -n 50 -o json | jq .body`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -133,7 +136,7 @@ func brokerURL(flag string) (*url.URL, error) {
 }
 
 func connect(ctx context.Context, a *app.App, u *url.URL) (d broker.Driver, err error) {
-	err = a.UI.Step(ctx, "Connecting to "+u.Redacted(), func(ctx context.Context) (err error) {
+	err = a.UI.Step(ctx, "Connecting to "+u.Scheme+"://"+u.Host+u.EscapedPath(), func(ctx context.Context) (err error) {
 		d, err = a.Brokers.Open(ctx, u)
 		return err
 	})
@@ -142,10 +145,15 @@ func connect(ctx context.Context, a *app.App, u *url.URL) (d broker.Driver, err 
 }
 
 func warnDeliveries(a *app.App, queue string, most int) {
-	if most > 0 {
-		a.UI.Warn(fmt.Sprintf("Messages in %s were already delivered up to %d times. "+
-			"Queues with a delivery limit drop or dead-letter messages past it, and some brokers count each peek.", queue, most))
+	if most < 1 {
+		return
 	}
+	times := "once"
+	if most > 1 {
+		times = fmt.Sprintf("up to %d times", most)
+	}
+	a.UI.Warn(fmt.Sprintf("Messages in %s were already delivered %s. "+
+		"Queues with a delivery limit drop or dead-letter messages past it, and some brokers count each peek.", queue, times))
 }
 
 func renderJSON(a *app.App, msgs []broker.Message) error {

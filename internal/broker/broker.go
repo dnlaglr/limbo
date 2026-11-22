@@ -148,11 +148,14 @@ type Opener func(ctx context.Context, u *url.URL) (Driver, error)
 
 type Registry map[string]Opener
 
-// Parse error is rebuilt because url.Error embeds the raw URL and password
+// Parse error is rebuilt because url.Error embeds the raw URL, and its detail can quote a password that ends the host early
 func ParseURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	switch {
+	case errors.As(err, &urlErr) && strings.Contains(raw, "@"):
+		return nil, errors.New("invalid broker URL: percent-encode special characters such as / ? # @ in the user name and password")
+	case errors.As(err, &urlErr):
 		return nil, fmt.Errorf("invalid broker URL: %w", urlErr.Err)
 	}
 

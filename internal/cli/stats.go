@@ -47,9 +47,11 @@ func newStatsCmd(a *app.App) *cobra.Command {
 		Use:   "stats <queue>",
 		Short: "Summarize a dead-letter queue without consuming it",
 		Long: `Stats reads every message in a dead-letter queue, as counted when it starts, and puts them all back, in their original
-order where the broker keeps one. It reports how many messages there are, when the oldest and newest died, and why they died. 
-Press Ctrl-C to stop early and see the counts so far.
+order where the broker keeps one. It reports how many messages there are, when the oldest and newest died, and why
+they died. Press Ctrl-C to stop early and see the counts so far.
+
 ` + readHelp + `
+
 ` + filterHelp,
 		Example: `  limbo stats orders.dlq
   limbo stats orders.dlq --from orders --newer-than 1h -o json | jq .reasons`,

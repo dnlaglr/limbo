@@ -105,8 +105,7 @@ func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
 
 Keep secrets out of the output:
 
-- The CLI prints the URL with `u.Redacted()`, which hides only the password in the user info. Don't accept secrets
-  anywhere else in the URL.
+- The CLI prints only the scheme, host and path of the URL. Don't accept secrets in the host or path.
 - Don't put the raw URL in an error.
 - If the broker's SDK has a credential chain, such as AWS, Azure or Google Cloud, reject user info and load credentials
   from the chain. The SQS driver shows how.
@@ -285,6 +284,10 @@ Start the broker or an emulator, then run:
 LIMBO_TEST_MYBROKER_URL=mybroker://localhost:7000 go test -race ./internal/broker/mybroker/
 ```
 
+CI runs the integration tests in the `integration` job in `.github/workflows/ci.yml`. Add the broker or emulator there
+as a service with a health check, and set your environment variable in the job's `env`. The job fails when any
+integration test skips, so a missing variable can't pass unnoticed.
+
 ## Checklist
 
 - [ ] `Open` rejects invalid URLs and never prints secrets.
@@ -293,4 +296,5 @@ LIMBO_TEST_MYBROKER_URL=mybroker://localhost:7000 go test -race ./internal/broke
 - [ ] `Replay`, if implemented, removes a message only after the broker confirms its copy.
 - [ ] The scheme is registered in `internal/app/app.go`.
 - [ ] The help text describes what the broker does to messages.
+- [ ] The broker runs as a service in the CI `integration` job, with its environment variable set.
 - [ ] `task test` and `task lint` pass, and the integration tests pass against the broker.
