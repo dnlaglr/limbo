@@ -110,7 +110,7 @@ func runStats(ctx context.Context, a *app.App, queue string, opts statsOptions) 
 	return err
 }
 
-func (s *queueStats) add(m broker.Message) {
+func (s *queueStats) add(m broker.Message) error {
 	s.Matched++
 	s.Reasons[cmp.Or(m.Reason(), "none")]++
 	s.deliveries = max(s.deliveries, m.DeliveryCount)
@@ -123,6 +123,8 @@ func (s *queueStats) add(m broker.Message) {
 			s.Newest = at
 		}
 	}
+
+	return nil
 }
 
 func renderStatsText(a *app.App, s *queueStats) error {

@@ -80,19 +80,22 @@ func count(ctx context.Context, a *app.App, d broker.Driver, queue string, also 
 	return n, err
 }
 
-func browse(ctx context.Context, a *app.App, d broker.Driver, queue string, sel broker.Selection, keep func(broker.Message)) (scanned int, err error) {
+// A keep error stops the read, and every message read goes back as usual
+func browse(ctx context.Context, a *app.App, d broker.Driver, queue string, sel broker.Selection, keep func(broker.Message) error) (scanned int, err error) {
 	matched := 0
 	err = a.UI.Progress(ctx, "Reading "+queue, func(ctx context.Context, set func(float64)) error {
-		return d.Browse(ctx, queue, sel.Scan, func(m broker.Message) bool {
+		var kept error
+		err := d.Browse(ctx, queue, sel.Scan, func(m broker.Message) bool {
 			scanned++
 			set(float64(scanned) / float64(sel.Scan))
 			if sel.Filter.Match(m) {
 				matched++
-				keep(m)
+				kept = keep(m)
 			}
 
-			return !sel.Full(matched)
+			return kept == nil && !sel.Full(matched)
 		})
+		return errors.Join(kept, err)
 	})
 	if err == nil && scanned < sel.Scan && !sel.Full(matched) {
 		a.UI.Warn(fmt.Sprintf("Read only %d of the %s counted in %s. Other consumers may have taken the rest, or the broker held "+

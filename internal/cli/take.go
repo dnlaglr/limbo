@@ -145,12 +145,13 @@ func newTakeRun(queue string, depth int, opts takeOptions, v verb) *takeRun {
 
 // The run that follows a plan covers only the messages the plan read and takes no more than it matched
 func plan(ctx context.Context, a *app.App, d broker.Driver, run *takeRun, target func(broker.Message) (string, error)) error {
-	scanned, err := browse(ctx, a, d, run.queue, run.sel, func(m broker.Message) {
+	scanned, err := browse(ctx, a, d, run.queue, run.sel, func(m broker.Message) error {
 		r := broker.Taken{Message: m}
 		if target != nil {
 			r.To, r.Err = target(m)
 		}
 		run.results = append(run.results, r)
+		return nil
 	})
 
 	run.skipped = scanned - len(run.results)
