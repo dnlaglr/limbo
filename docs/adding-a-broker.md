@@ -1,8 +1,8 @@
 # Adding a broker
 
 limbo reaches every broker through the interfaces in `internal/broker`. To add a broker, you write a driver package
-that implements them and register a URL scheme for it. The `peek`, `stats`, `export`, `replay`, `delete` and `purge`
-commands, filters included, then work with the new broker without changes.
+that implements them and register a URL scheme for it. The `peek`, `stats`, `export`, `replay`, `delete`, `purge` and
+`import` commands, filters included, then work with the new broker without changes.
 
 The RabbitMQ driver (`internal/broker/rabbitmq`) and the SQS driver (`internal/broker/sqs`) are the reference
 implementations.
@@ -23,7 +23,7 @@ filters. `broker.Replay` and `broker.Remove` apply them to each message your `Ta
 |---|---|---|---|
 | `broker.Driver` | `Browse`, `Depth`, `Close` | Yes | `peek`, `stats`, `export` |
 | `broker.Taker` | `Take` | No | `delete`, `purge` |
-| `broker.Publisher` | `Publish` | No | `replay`, together with `Taker` |
+| `broker.Publisher` | `Publish` | No | `import`, and `replay` together with `Taker` |
 | `broker.Purger` | `Purge` | No | `purge --no-backup` as one fast call, instead of removing messages one by one |
 
 `broker.Replayer` is `Taker` and `Publisher` together. limbo finds each capability by type assertion, so a driver
@@ -234,6 +234,11 @@ When you implement `Take`, its remove, `Publish` and the copy:
 - Build the copy from the `broker.Message` alone, using `Headers` and `Properties`, so it doesn't depend on where the
   message came from. Drop the broker's dead-letter metadata. Set `x-limbo-replay-count` to the previous value plus
   one, and set `x-limbo-replayed-at` to the current time.
+- Accept the message as `limbo import` decodes it from a file, too. There, numbers are `json.Number`, objects are
+  `map[string]any`, bytes are base64 strings, and `Properties` holds what your `toMessage` recorded, decoded the same
+  way. Restore each value's type from your own properties, as the RabbitMQ driver does with `header_types` and the SQS
+  driver with `attribute_types`, and pass native values through unchanged. A file from another broker has none of
+  your properties, so turn its values into the closest type your broker accepts.
 - Run the remove and `Publish` under `context.WithoutCancel(ctx)` with a timeout, as `Publish` does above, so Ctrl-C
   can't leave a message half removed or half replayed.
 - If the destination deduplicates, as SQS FIFO queues do, derive the deduplication ID from the dead-letter copy's ID.
@@ -321,9 +326,11 @@ Against a real broker or an emulator, test that:
 - A message without dead-letter history fails with `broker.ErrNoOrigin` unless `To` is set.
 - A filtered `broker.Remove` backs up and removes only the matching messages, and leaves the rest in order.
 - `Purge`, if implemented, empties the queue and reports a missing queue.
+- A message browsed, written as an export line and read back, then published with `broker.Import`, arrives with the
+  same body, headers and properties as the original, apart from limbo's markers.
 
-Run these through `broker.Replay` and `broker.Remove`, as the CLI does, so they cover your driver together with the
-shared rules.
+Run these through `broker.Replay`, `broker.Remove` and `broker.Import`, as the CLI does, so they cover your driver
+together with the shared rules.
 
 Start the broker or an emulator, then run:
 

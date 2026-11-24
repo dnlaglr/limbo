@@ -23,6 +23,7 @@ for RabbitMQ and Amazon SQS. More brokers are planned.
   its copy.
 - `limbo export` saves messages to a file and leaves every message in the queue.
 - `limbo delete` and `limbo purge` remove poison messages for good, saving each one to a backup file first.
+- `limbo import` publishes an export or backup file again, to undo a delete or move messages elsewhere.
 
 ## Install
 
@@ -209,11 +210,47 @@ also removes messages that arrive while it runs:
 - Limbo creates the file before it asks, so a path it can't write fails before anything is read. If nothing is
   removed, the file is deleted again.
 
+To undo a delete or purge, import the backup.
+
+### import
+
+```bash
+limbo import orders.dlq-20261122T101500Z.ndjson --dry-run
+limbo import backup.ndjson --to orders.dlq --yes
+limbo import backup.ndjson --reason rejected --rate 50 --skip 500
+```
+
+Publishes the messages in an export or backup file to the queue each one died in, or to `--to`. Messages with no
+dead-letter history are reported and skipped unless you pass `--to`. Nothing is removed from the file.
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Show where each message would go without publishing anything |
+| `-y`, `--yes` | Import without asking first. Required without a terminal |
+| `--to <queue>` | Publish into this queue instead of the one each message died in |
+| `-n`, `--limit <n>` | Import at most this many matching messages (default all) |
+| `--rate <n>` | Import at most this many messages per second (default unlimited) |
+| `--skip <n>` | Start after line `n` of the file, to continue an import that stopped |
+
+- Limbo reads the whole file before it publishes anything. If a line isn't a record it can read, it stops with the
+  line number and publishes nothing.
+- Copies follow replay's rules: they drop the broker's dead-letter headers, carry `x-limbo-replay-count` and
+  `x-limbo-replayed-at`, and on an SQS FIFO queue use `limbo-` followed by the message ID as their deduplication ID.
+  They keep the body and the headers and properties the file records, with their types.
+- If an import stops early, limbo's error names the line it stopped after. Run the same command with `--skip` and that
+  line number to continue without sending a message twice. After a send that timed out, the line given is the one
+  before it, so the message whose arrival is unknown is sent again rather than skipped.
+- Limbo's error also lists the lines of messages it could not publish, such as those with no dead-letter history,
+  and `--skip` doesn't send them again. Fix the cause and import those lines on their own, for example with
+  `--skip <line - 1> -n 1`.
+- A file from the other broker imports on a best-effort basis. RabbitMQ takes SQS message attributes as string
+  headers. SQS turns RabbitMQ headers into `String` and `Number` attributes, and refuses a message with more than 10.
+
 ### Common flags
 
 | Flag | Effect |
 |---|---|
-| `-o`, `--output text\|json` | Output format for `peek`, `stats`, `replay`, `delete` and `purge` |
+| `-o`, `--output text\|json` | Output format for `peek`, `stats`, `replay`, `delete`, `purge` and `import` |
 | `-q`, `--quiet` | Print only results and errors, without status lines or warnings |
 | `--no-color` | Disable colored output, same as `NO_COLOR=1` |
 | `--debug` | Print debug logs to stderr |
@@ -223,8 +260,8 @@ records no commit or date for it.
 
 ## Filters
 
-`peek`, `stats`, `replay`, `export` and `delete` take the same filters. They pick messages by their ID, last death,
-headers, body and age.
+`peek`, `stats`, `replay`, `export`, `delete` and `import` take the same filters. They pick messages by their ID, last
+death, headers, body and age.
 
 | Filter | Matches messages |
 |---|---|
@@ -285,10 +322,18 @@ messages without reading them, so it prints one object with the depth it counted
 {"queue":"orders.dlq","status":"purged","depth":6}
 ```
 
+`import` prints one record per message with the file line it came from, and the status `imported`, `failed`,
+`would_import` or `would_fail`:
+
+```json
+{"line":1,"id":"o1","to":"orders","status":"imported"}
+{"line":6,"id":"orphan","status":"failed","error":"no dead-letter history, pass --to to choose a destination"}
+```
+
 ## Export files
 
-`export` and the backups of `delete` and `purge` write one message per line. Each line is the message as `peek -o json`
-prints it, with `"version":1` first:
+`export` and the backups of `delete` and `purge` write one message per line, and `import` publishes them again. Each
+line is the message as `peek -o json` prints it, with `"version":1` first:
 
 ```json
 {"version":1,"id":"o1","queue":"orders.dlq","content_type":"application/json","headers":{"tenant":"acme"},"properties":{"app_id":"shop","delivery_mode":2},"deaths":[{"queue":"orders","reason":"rejected","count":1,"time":"2026-11-22T21:57:05Z","routing_keys":["orders"]}],"body":"{\"orderId\":1042}","body_encoding":"utf-8"}
@@ -312,7 +357,7 @@ format would change `version`.
 | Code | Meaning |
 |---|---|
 | `0` | Success, including an empty queue or a run you declined |
-| `1` | An error: invalid flags or URL, a connection or broker error, a file limbo can't write, a replay or delete that left messages it could not move or back up, or a replay, delete or purge without `--yes` and without a terminal |
+| `1` | An error: invalid flags or URL, a connection or broker error, a file limbo can't read or write, a replay or delete that left messages it could not move or back up, an import with messages it could not publish, or a replay, delete, purge or import without `--yes` and without a terminal |
 | `130` | Interrupted by Ctrl-C or SIGTERM. Limbo returns the messages it holds before it exits |
 
 ## Safety
@@ -328,12 +373,15 @@ format would change `version`.
 - `export` never removes a message.
 - `delete` and `purge` remove a message only after its line in the backup is written and flushed to disk, unless you
   pass `--no-backup`. Messages they skip, can't back up or don't reach go back to the dead-letter queue.
+- `import` publishes nothing from a file with a line it can't read, and never changes the file.
 - Limbo never prints the credentials in the broker URL, and never overwrites a file.
 
 ### Caveats
 
 - **Replay is at least once.** If the connection drops after the broker confirms a copy but before limbo removes the
   original, the message ends up in both queues. Consumers should tolerate duplicates.
+- **Importing a file twice sends its messages twice.** The file keeps every message, so a second import publishes them
+  again. Only SQS FIFO queues drop a copy they saw in the last 5 minutes. Continue a stopped import with `--skip`.
 - **Reading a message is a delivery.** Brokers have no way to read a queue without handing out its messages, so the
   messages look delivered afterwards. See the broker sections below.
 - **Other consumers of the dead-letter queue don't see the messages limbo holds** until it returns them.
@@ -382,7 +430,8 @@ format would change `version`.
 ### SQS permissions
 
 `peek`, `stats` and `export` need the first statement. `replay`, `delete` and `purge` also need the second, and
-`replay` needs a statement like the last one for every queue it sends to:
+`replay` needs a statement like the last one for every queue it sends to. `import` reads no queue, so it needs only a
+statement like the last one for every queue it publishes to:
 
 ```json
 {
