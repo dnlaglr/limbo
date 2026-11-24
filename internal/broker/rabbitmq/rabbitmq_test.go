@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"reflect"
@@ -131,6 +132,152 @@ func TestRepublishing(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("republishing() =\n%+v\nwant\n%+v", got, want)
 	}
+}
+
+func TestRepublishingFromFile(t *testing.T) {
+	now := time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC)
+
+	t.Run("same broker", func(t *testing.T) {
+		native := toMessage("orders.dlq", &amqp.Delivery{
+			MessageId:       "4f1c2a7e",
+			ContentType:     "application/json",
+			ContentEncoding: "gzip",
+			DeliveryMode:    amqp.Persistent,
+			Priority:        5,
+			CorrelationId:   "c-1",
+			ReplyTo:         "replies",
+			Expiration:      "60000",
+			Type:            "order.created",
+			UserId:          "guest",
+			AppId:           "shop",
+			Timestamp:       now.Add(-time.Hour),
+			Body:            []byte(`{"orderId":1042}`),
+			Headers:         typedHeaders(now),
+		})
+
+		if got, want := republishing(viaFile(t, native), now), republishing(native, now); !reflect.DeepEqual(got, want) {
+			t.Errorf("republishing() of the message read back from a file =\n%#v\nwant the same as from the queue\n%#v", got, want)
+		}
+	})
+
+	t.Run("hand-edited values", func(t *testing.T) {
+		got := republishing(broker.Message{
+			ID: "id-1",
+			Headers: map[string]any{
+				"small": json.Number("300"),
+				"neg":   json.Number("-1"),
+				"price": map[string]any{"scale": json.Number("2")},
+			},
+			Properties: map[string]any{"header_types": map[string]any{"small": "int8", "neg": "uint16", "price": "decimal"}},
+		}, now)
+
+		if got.Headers["small"] != json.Number("300") || got.Headers["neg"] != json.Number("-1") || got.Headers.Validate() == nil {
+			t.Errorf("headers = %#v; want values that don't fit their type left as they are, for the broker to refuse", got.Headers)
+		}
+	})
+
+	t.Run("sqs file", func(t *testing.T) {
+		got := republishing(viaFile(t, broker.Message{
+			ID:         "id-1",
+			Body:       []byte("b"),
+			Headers:    map[string]any{"tenant": "acme", "MessageGroupId": "g", "meta": map[string]any{"n": 1}},
+			Properties: map[string]any{"attribute_types": map[string]string{"n": "Number"}},
+		}), now)
+
+		if !reflect.DeepEqual(got.Headers["meta"], amqp.Table{"n": int64(1)}) || got.Headers.Validate() != nil {
+			t.Errorf("headers = %#v, validate = %v; want meta as amqp.Table{n: int64(1)} and headers RabbitMQ accepts", got.Headers, got.Headers.Validate())
+		}
+	})
+}
+
+func TestImportRoundTrip(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			ctx := context.Background()
+			d, ch := connect(t)
+			from, to := testQueue(queueType), testQueue(queueType)+".imported"
+			declare(t, ch, from, queueType, amqp.Table{})
+			declare(t, ch, to, queueType, amqp.Table{})
+
+			at := time.Now().UTC().Truncate(time.Second)
+			publish(t, ch, from, amqp.Publishing{
+				MessageId:       "m0",
+				ContentType:     "application/json",
+				ContentEncoding: "gzip",
+				DeliveryMode:    amqp.Persistent,
+				Priority:        5,
+				CorrelationId:   "c-1",
+				ReplyTo:         "replies",
+				Type:            "order.created",
+				UserId:          "guest",
+				AppId:           "shop",
+				Timestamp:       at,
+				Body:            []byte{0xff, 0x00, 'o', 'k'},
+				Headers:         typedHeaders(at),
+			})
+			waitForDepth(t, ch, from, 1)
+			original := browseOne(t, d, from)
+
+			err := broker.Import(ctx, d.(broker.Publisher), func(yield func(broker.Message, error) bool) { yield(viaFile(t, original), nil) },
+				broker.ReplayOptions{To: to}, func(broker.Taken) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, ch, to, 1)
+
+			copied := browseOne(t, d, to)
+			delete(copied.Headers, replayCountHeader)
+			delete(copied.Headers, replayedAtHeader)
+			types := copied.Properties["header_types"].(map[string]string)
+			delete(types, replayCountHeader)
+			delete(types, replayedAtHeader)
+			if copied.ID != original.ID || string(copied.Body) != string(original.Body) || !copied.Timestamp.Equal(original.Timestamp) ||
+				!reflect.DeepEqual(copied.Headers, original.Headers) || !reflect.DeepEqual(copied.Properties, original.Properties) {
+				t.Errorf("imported copy =\n%#v\nwant the original apart from limbo's markers\n%#v", copied, original)
+			}
+		})
+	}
+}
+
+// Typed headers as RabbitMQ hands them out, including a 64-bit value above 2^53 and a nested table
+func typedHeaders(at time.Time) amqp.Table {
+	return amqp.Table{
+		"tenant":  "acme",
+		"vip":     true,
+		"attempt": int32(3),
+		"ratio":   float64(0.5),
+		"price":   amqp.Decimal{Scale: 2, Value: 1999},
+		"sent-at": at.Add(-2 * time.Hour),
+		"sig":     []byte{1, 2},
+		"big":     int64(1<<60 + 1),
+		"trace":   amqp.Table{"hop": int64(2), "via": "eu", "path": []any{"a", int64(1)}},
+	}
+}
+
+// Writes m as an export file line would and reads it back
+func viaFile(t *testing.T, m broker.Message) broker.Message {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded broker.Message
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+
+	return decoded
+}
+
+func browseOne(t *testing.T, d broker.Driver, queue string) broker.Message {
+	t.Helper()
+	var got broker.Message
+	if err := d.Browse(context.Background(), queue, 1, func(m broker.Message) bool { got = m; return false }); err != nil {
+		t.Fatal(err)
+	}
+
+	return got
 }
 
 func TestBrowseLeavesMessages(t *testing.T) {

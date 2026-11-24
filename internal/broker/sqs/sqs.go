@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -160,17 +162,16 @@ func (d *driver) Purge(ctx context.Context, queue string) error {
 }
 
 func sendInput(addr, to string, m broker.Message, now time.Time) *awssqs.SendMessageInput {
-	dataTypes, _ := m.Properties[attributeTypes].(map[string]string)
+	dataTypes := broker.StringMap(m.Properties[attributeTypes])
 	attrs := map[string]types.MessageAttributeValue{}
 	for k, v := range m.Headers {
 		if k != groupHeader && k != replayCountAttr && k != replayedAtAttr {
-			attrs[k] = attribute(cmp.Or(dataTypes[k], "String"), v)
+			attrs[k] = attribute(dataTypes[k], v)
 		}
 	}
 
-	previous, _ := m.Headers[replayCountAttr].(string)
 	if len(attrs)+2 <= maxAttributes {
-		attrs[replayCountAttr] = attribute("Number", strconv.Itoa(atoi(previous)+1))
+		attrs[replayCountAttr] = attribute("Number", strconv.Itoa(atoi(fmt.Sprint(m.Headers[replayCountAttr]))+1))
 		attrs[replayedAtAttr] = attribute("String", now.UTC().Format(time.RFC3339))
 	}
 
@@ -187,15 +188,33 @@ func sendInput(addr, to string, m broker.Message, now time.Time) *awssqs.SendMes
 	return in
 }
 
+// A message read back from a file holds Binary values as base64 strings, and one from another broker any JSON value, so each
+// becomes the closest attribute and a recorded data type always wins
 func attribute(dataType string, v any) types.MessageAttributeValue {
-	a := types.MessageAttributeValue{DataType: &dataType}
-	if b, ok := v.([]byte); ok {
-		a.BinaryValue = b
-	} else {
-		a.StringValue = aws.String(fmt.Sprint(v))
+	text := func(s, fallback string) types.MessageAttributeValue {
+		return types.MessageAttributeValue{DataType: aws.String(cmp.Or(dataType, fallback)), StringValue: &s}
 	}
 
-	return a
+	switch v := v.(type) {
+	case []byte:
+		return types.MessageAttributeValue{DataType: aws.String(cmp.Or(dataType, "Binary")), BinaryValue: v}
+	case string:
+		if !strings.HasPrefix(dataType, "Binary") {
+			return text(v, "String")
+		}
+		b, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			b = []byte(v)
+		}
+		return types.MessageAttributeValue{DataType: &dataType, BinaryValue: b}
+	case json.Number:
+		return text(v.String(), "Number")
+	case map[string]any, []any:
+		b, _ := json.Marshal(v)
+		return text(string(b), "String")
+	}
+
+	return text(fmt.Sprint(v), "String")
 }
 
 func (d *driver) queueURL(ctx context.Context, name string) (string, error) {
