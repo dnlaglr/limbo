@@ -95,6 +95,11 @@ type Publisher interface {
 	Publish(ctx context.Context, queue string, m Message) error
 }
 
+// Purger removes every message at once, without reading them
+type Purger interface {
+	Purge(ctx context.Context, queue string) error
+}
+
 type Replayer interface {
 	Taker
 	Publisher
@@ -103,6 +108,11 @@ type Replayer interface {
 type ReplayOptions struct {
 	Selection
 	To string
+}
+
+type RemoveOptions struct {
+	Selection
+	Backup func(Message) error
 }
 
 var ErrNoOrigin = errors.New("no dead-letter history, pass --to to choose a destination")
@@ -131,6 +141,19 @@ func Replay(ctx context.Context, d Replayer, queue string, opts ReplayOptions, e
 			err = d.Publish(ctx, to, m)
 		}
 		return to, err
+	}
+
+	return d.Take(ctx, queue, opts.Scan, r.next)
+}
+
+// A backup that fails ends the run, since every message after it would fail the same way
+func Remove(ctx context.Context, d Taker, queue string, opts RemoveOptions, each func(Taken)) error {
+	r := &run{sel: opts.Selection, each: each, stop: func(error) bool { return true }}
+	r.keep = func(m Message) (string, error) {
+		if opts.Backup == nil {
+			return "", nil
+		}
+		return "", opts.Backup(m)
 	}
 
 	return d.Take(ctx, queue, opts.Scan, r.next)

@@ -28,7 +28,11 @@ type takeOptions struct {
 
 type verb struct{ base, past, doing string }
 
-var replaying = verb{"replay", "replayed", "Replaying"}
+var (
+	replaying = verb{"replay", "replayed", "Replaying"}
+	deleting  = verb{"delete", "deleted", "Deleting"}
+	purging   = verb{"purge", "purged", "Purging"}
+)
 
 // A taker is what a command does with the messages it takes, picked once limbo knows what the broker supports
 type taker struct {
@@ -37,6 +41,7 @@ type taker struct {
 	ask    func(run *takeRun) string
 	note   string
 	take   func(ctx context.Context, run *takeRun, each func(broker.Taken)) error
+	purge  func(ctx context.Context) error
 }
 
 type takeRun struct {
@@ -48,6 +53,7 @@ type takeRun struct {
 	skipped int
 	verb    verb
 	routed  bool
+	backup  string
 }
 
 type takeRecord struct {
@@ -55,6 +61,12 @@ type takeRecord struct {
 	To     string `json:"to,omitempty"`
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+}
+
+type purgeRecord struct {
+	Queue  string `json:"queue"`
+	Status string `json:"status"`
+	Depth  int    `json:"depth"`
 }
 
 var takeRenderers = map[string]func(*app.App, *takeRun) error{
@@ -101,6 +113,9 @@ func runTake(ctx context.Context, a *app.App, in io.Reader, queue string, opts t
 
 	run := newTakeRun(queue, depth, opts, v)
 	run.routed = t.target != nil
+	if t.purge != nil && !opts.dryRun {
+		return purgeAll(ctx, a, in, t, run, opts)
+	}
 	if opts.dryRun || !run.sel.Filter.IsZero() && !opts.yes {
 		if err := plan(ctx, a, d, run, t.target); err != nil {
 			return err
@@ -187,6 +202,28 @@ func takeAll(ctx context.Context, a *app.App, t *taker, run *takeRun) error {
 	})
 }
 
+func purgeAll(ctx context.Context, a *app.App, in io.Reader, t *taker, run *takeRun, opts takeOptions) error {
+	if !opts.yes {
+		if ok, err := confirm(ctx, a, in, t.ask(run), run.verb); !ok {
+			return err
+		}
+	}
+
+	if err := a.UI.Step(ctx, "Purging "+run.queue, t.purge); err != nil {
+		return err
+	}
+
+	var err error
+	if opts.output == "json" {
+		err = json.NewEncoder(a.UI.Out()).Encode(purgeRecord{Queue: run.queue, Status: "purged", Depth: run.sel.Scan})
+	} else {
+		a.UI.Panel(run.queue, ui.Row{Key: "Purged", Value: countMessages(run.sel.Scan)})
+	}
+	a.UI.Success(fmt.Sprintf("Purged %s, which held %s", run.queue, countMessages(run.sel.Scan)))
+
+	return err
+}
+
 func finish(a *app.App, run *takeRun, note string, err, renderErr error) error {
 	returned := 0
 	for _, r := range run.results {
@@ -196,6 +233,9 @@ func finish(a *app.App, run *takeRun, note string, err, renderErr error) error {
 	}
 	if done := len(run.results) - returned; done > 0 {
 		a.UI.Success(capitalize(run.verb.past) + " " + countMessages(done))
+	}
+	if run.backup != "" {
+		a.UI.Info("Backup: " + run.backup)
 	}
 
 	switch {

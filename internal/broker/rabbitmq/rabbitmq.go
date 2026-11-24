@@ -73,6 +73,17 @@ func (d *driver) Publish(_ context.Context, queue string, m broker.Message) erro
 	return d.out.publish(queue, republishing(m, time.Now()))
 }
 
+func (d *driver) Purge(_ context.Context, queue string) error {
+	ch, err := d.conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	_, err = ch.QueuePurge(queue, false)
+	return queueError(queue, err)
+}
+
 // Deliveries visit doesn't remove stay unacked until one multiple nack returns them all in order
 // Closing the channel instead would count as a failed delivery against a quorum queue's delivery limit
 // TODO: One basic.get round trip per message, a prefetching consumer is the upgrade if big scans get too slow

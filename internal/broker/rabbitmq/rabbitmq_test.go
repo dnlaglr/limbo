@@ -286,6 +286,34 @@ func TestFilteredReplay(t *testing.T) {
 	}
 }
 
+func TestRemove(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			d, ch := connect(t)
+			dlq := deadLetter(t, ch, testQueue(queueType), queueType, 5)
+
+			var backedUp, got []string
+			opts := broker.RemoveOptions{
+				Selection: broker.Selection{Filter: broker.Filter{IDs: broker.Rule[string]{Any: []string{"m1", "m3"}}}, Scan: 5},
+				Backup:    func(m broker.Message) error { backedUp = append(backedUp, m.ID); return nil },
+			}
+			err := broker.Remove(context.Background(), d.(broker.Taker), dlq, opts, func(r broker.Taken) { got = append(got, outcome(r)) })
+			skipped := " →  ✗ " + broker.ErrSkipped.Error()
+			if want := []string{"m0" + skipped, "m1 → ", "m2" + skipped, "m3 → ", "m4" + skipped}; err != nil || !slices.Equal(got, want) {
+				t.Fatalf("Remove() = %q, %v; want %q", got, err, want)
+			}
+			if !slices.Equal(backedUp, []string{"m1", "m3"}) {
+				t.Errorf("backed up %q, want m1 and m3", backedUp)
+			}
+
+			waitForDepth(t, ch, dlq, 3)
+			if ids := browseIDs(t, d, dlq, 3); !slices.Equal(ids, []string{"m0", "m2", "m4"}) {
+				t.Fatalf("%s holds %q after a filtered remove, want the rest in order", dlq, ids)
+			}
+		})
+	}
+}
+
 func TestPublishAfterClosedChannel(t *testing.T) {
 	ctx := context.Background()
 	d, ch := connect(t)
@@ -300,6 +328,26 @@ func TestPublishAfterClosedChannel(t *testing.T) {
 		t.Fatalf("Publish() after the broker closed the channel = %v, want nil", err)
 	}
 	waitForDepth(t, ch, queue, 1)
+}
+
+func TestPurge(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			d, ch := connect(t)
+			source := testQueue(queueType)
+			dlq := deadLetter(t, ch, source, queueType, 3)
+
+			if err := d.(broker.Purger).Purge(context.Background(), dlq); err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, ch, dlq, 0)
+
+			missing := source + ".missing"
+			if err := d.(broker.Purger).Purge(context.Background(), missing); err == nil || err.Error() != `queue "`+missing+`" not found` {
+				t.Errorf("purge of a missing queue: err = %v", err)
+			}
+		})
+	}
 }
 
 func firstN(n int) broker.ReplayOptions {

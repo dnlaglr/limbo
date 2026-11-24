@@ -142,6 +142,23 @@ func (d *driver) Publish(ctx context.Context, queue string, m broker.Message) er
 	return nil
 }
 
+func (d *driver) Purge(ctx context.Context, queue string) error {
+	ctx, cancel := settle(ctx)
+	defer cancel()
+
+	addr, err := d.queueURL(ctx, queue)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.client.PurgeQueue(ctx, &awssqs.PurgeQueueInput{QueueUrl: &addr})
+	if _, ok := errors.AsType[*types.PurgeQueueInProgress](err); ok {
+		return errors.New("only one purge per SQS queue is allowed every 60 seconds, try again in a minute")
+	}
+
+	return err
+}
+
 func sendInput(addr, to string, m broker.Message, now time.Time) *awssqs.SendMessageInput {
 	dataTypes, _ := m.Properties[attributeTypes].(map[string]string)
 	attrs := map[string]types.MessageAttributeValue{}

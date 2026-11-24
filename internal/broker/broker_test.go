@@ -92,7 +92,7 @@ var errRemove = errors.New("remove failed")
 
 func TestTake(t *testing.T) {
 	died := func(id, queue string) Message { return Message{ID: id, Deaths: []Death{{Queue: queue}}} }
-	refused := errors.New("refused")
+	refused, errFull := errors.New("refused"), errors.New("disk full")
 	timeout := fmt.Errorf("no confirm: %w", context.DeadlineExceeded)
 	notPayments := Filter{Sources: Rule[string]{None: []string{"payments"}}}
 	a, b, o, p := died("a", "orders"), died("b", "orders"), Message{ID: "o"}, died("p", "payments")
@@ -104,6 +104,9 @@ func TestTake(t *testing.T) {
 		limit      int
 		refuse     map[string]error
 		failRemove string
+		remove     bool
+		backupFail string
+		noBackup   bool
 		wantLog    []string
 		want       []string
 		wantErr    error
@@ -133,6 +136,21 @@ func TestTake(t *testing.T) {
 			wantLog: []string{"publish a>orders", "remove a"},
 			want:    []string{"a → orders"},
 		},
+		{
+			name: "remove with backup", msgs: []Message{a, p, b}, filter: notPayments, remove: true,
+			wantLog: []string{"backup a", "remove a", "backup b", "remove b"},
+			want:    []string{"a → ", "p →  ✗ " + ErrSkipped.Error(), "b → "},
+		},
+		{
+			name: "backup fails", msgs: []Message{a, b}, remove: true, backupFail: "a",
+			wantLog: []string{"backup a"},
+			want:    []string{"a →  ✗ disk full"}, wantErr: errFull,
+		},
+		{
+			name: "remove without backup", msgs: []Message{a, o}, remove: true, noBackup: true,
+			wantLog: []string{"remove a", "remove o"},
+			want:    []string{"a → ", "o → "},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -147,7 +165,22 @@ func TestTake(t *testing.T) {
 				got = append(got, s)
 			}
 
-			err := Replay(context.Background(), q, "dlq", ReplayOptions{Selection: sel}, each)
+			var err error
+			switch {
+			case !tt.remove:
+				err = Replay(context.Background(), q, "dlq", ReplayOptions{Selection: sel}, each)
+			case tt.noBackup:
+				err = Remove(context.Background(), q, "dlq", RemoveOptions{Selection: sel}, each)
+			default:
+				err = Remove(context.Background(), q, "dlq", RemoveOptions{Selection: sel, Backup: func(m Message) error {
+					q.log = append(q.log, "backup "+m.ID)
+					if m.ID == tt.backupFail {
+						return errFull
+					}
+					return nil
+				}}, each)
+			}
+
 			if !slices.Equal(q.log, tt.wantLog) || !slices.Equal(got, tt.want) || !errors.Is(err, tt.wantErr) || (tt.wantErr == nil) != (err == nil) {
 				t.Errorf("did %q, reported %q, err %v; want %q, %q, %v", q.log, got, err, tt.wantLog, tt.want, tt.wantErr)
 			}

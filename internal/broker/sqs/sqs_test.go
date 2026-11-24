@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -329,6 +330,54 @@ func TestReleaseSkipsLostHolds(t *testing.T) {
 	}
 	if err := d.release(ctx, addr, held); err != nil {
 		t.Errorf("release() of holds that ran out = %v, want nil since limbo no longer holds those messages", err)
+	}
+}
+
+func TestRemove(t *testing.T) {
+	for _, kind := range []string{"standard", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			fifo := kind == "fifo"
+			d := connect(t)
+			_, dlq := deadLetter(t, d, fifo, 4)
+
+			var backedUp []string
+			opts := broker.RemoveOptions{
+				Selection: broker.Selection{Filter: broker.Filter{Bodies: broker.Rule[*regexp.Regexp]{Any: []*regexp.Regexp{regexp.MustCompile(`^m[12]$`)}}}, Scan: 4},
+				Backup:    func(m broker.Message) error { backedUp = append(backedUp, string(m.Body)); return nil },
+			}
+			removed := 0
+			err := broker.Remove(context.Background(), d, dlq, opts, func(r broker.Taken) {
+				if r.Err == nil {
+					removed++
+				}
+			})
+			if err != nil || removed != 2 || !slices.Equal(inOrder(fifo, backedUp), []string{"m1", "m2"}) {
+				t.Fatalf("Remove() removed %d, backed up %q, err %v; want m1 and m2", removed, backedUp, err)
+			}
+
+			waitForDepth(t, d, dlq, 2)
+			if got := inOrder(fifo, browseBodies(t, d, dlq, 2)); !slices.Equal(got, []string{"m0", "m3"}) {
+				t.Fatalf("%s holds %q after a filtered remove, want m0 and m3", dlq, got)
+			}
+		})
+	}
+}
+
+func TestPurge(t *testing.T) {
+	for _, kind := range []string{"standard", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			d := connect(t)
+			_, dlq := deadLetter(t, d, kind == "fifo", 3)
+
+			if err := d.Purge(context.Background(), dlq); err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, d, dlq, 0)
+
+			if err := d.Purge(context.Background(), missingQueue); err == nil || err.Error() != `queue "`+missingQueue+`" not found` {
+				t.Errorf("purge of a missing queue: err = %v", err)
+			}
+		})
 	}
 }
 
