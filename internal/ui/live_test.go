@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,18 @@ func TestProgress(t *testing.T) {
 				t.Errorf("stderr = %q, want prefix %q and an elapsed time", got, tt.prefix)
 			}
 		})
+	}
+}
+
+func TestThrottled(t *testing.T) {
+	var sent []float64
+	set := throttled(func(p float64) { sent = append(sent, p) })
+	for _, p := range []float64{0, 0.0004, 0.0009, 0.001, 0.0015, 0.5, 0.2} {
+		set(p)
+	}
+
+	if want := []float64{0, 0.001, 0.5, 0.2}; !slices.Equal(sent, want) {
+		t.Errorf("sent %v, want %v: steps under 0.1%% dropped, a step back always sent", sent, want)
 	}
 }
 

@@ -92,7 +92,7 @@ func (u *UI) animate(ctx context.Context, t *task, fn func(ctx context.Context, 
 
 	errc := make(chan error, 1)
 	go func() {
-		errc <- fn(ctx, func(pct float64) { p.Send(percentMsg(pct)) })
+		errc <- fn(ctx, throttled(func(pct float64) { p.Send(percentMsg(pct)) }))
 		p.Send(doneMsg{})
 	}()
 
@@ -103,4 +103,15 @@ func (u *UI) animate(ctx context.Context, t *task, fn func(ctx context.Context, 
 	}
 
 	return err
+}
+
+// Every update renders the whole line, so a fast local read would spend more time drawing than reading without this
+func throttled(send func(float64)) func(float64) {
+	last := -1.0
+	return func(p float64) {
+		if p < last || p-last >= 0.001 {
+			last = p
+			send(p)
+		}
+	}
 }

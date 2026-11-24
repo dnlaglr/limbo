@@ -15,7 +15,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "limbo",
 		Short: "Get failed messages out of limbo. Safely.",
-		Long:  "Limbo inspects, triages and replays dead-letter queue messages, with the same workflow for every broker.",
+		Long:  "Limbo inspects, triages, replays and cleans up dead-letter queue messages, with the same workflow for every broker.",
 		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
 			a.Apply(s)
 			a.Log.Debug("starting", "command", cmd.CommandPath(), "version", a.Build.Version)

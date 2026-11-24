@@ -29,7 +29,8 @@ func newImportCmd(a *app.App) *cobra.Command {
 		Use:   "import <file>",
 		Short: "Publish the messages in an export or backup file",
 		Long: `Import publishes the messages in a file that export, delete or purge wrote, to the queue each one died in or to --to.
-Messages with no dead-letter history are reported and skipped unless you pass --to. Nothing is removed from the file.
+Messages with no dead-letter history fail unless you pass --to, and limbo then exits with code 1. Nothing is removed
+from the file.
 
 Limbo reads the whole file before it publishes anything, and stops with the line number if a line isn't a record it
 can read. Copies follow replay's rules: they drop the broker's dead-letter headers, carry x-limbo-replay-count and
@@ -81,7 +82,16 @@ func runImport(ctx context.Context, a *app.App, in io.Reader, path string, opts 
 		return errors.New("refusing to import without confirmation: pass --yes, or --dry-run to preview")
 	}
 
-	src, err := readFile(path, opts.skip)
+	u, err := brokerURL(opts.url)
+	if err != nil {
+		return err
+	}
+
+	var src *messageSource
+	err = a.UI.Progress(ctx, "Checking "+path, func(ctx context.Context, set func(float64)) (err error) {
+		src, err = readFile(ctx, path, opts.skip, set)
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -92,11 +102,6 @@ func runImport(ctx context.Context, a *app.App, in io.Reader, path string, opts 
 			a.UI.Info(path + " holds no messages")
 		}
 		return nil
-	}
-
-	u, err := brokerURL(opts.url)
-	if err != nil {
-		return err
 	}
 
 	d, err := connect(ctx, a, u)
@@ -118,7 +123,7 @@ func runImport(ctx context.Context, a *app.App, in io.Reader, path string, opts 
 	run := newTakeRun(path, src.count, opts.takeOptions, importing)
 	run.routed, run.last = true, opts.skip
 	route := broker.ReplayOptions{To: opts.to}
-	if done, err := preview(a, run, opts.takeOptions, render, route.Target, src.read(run)); done {
+	if done, err := preview(a, run, opts.takeOptions, render, route.Target, src.read(ctx, run)); done {
 		return err
 	}
 
@@ -133,7 +138,7 @@ func runImport(ctx context.Context, a *app.App, in io.Reader, path string, opts 
 		pace, stop := pacer(ctx, opts.rate)
 		defer stop()
 
-		return broker.Import(ctx, p, src.messages(run), broker.ReplayOptions{Selection: run.sel, To: opts.to}, func(res broker.Taken) {
+		return broker.Import(ctx, p, src.messages(ctx, run), broker.ReplayOptions{Selection: run.sel, To: opts.to}, func(res broker.Taken) {
 			each(res)
 			if !errors.Is(res.Err, broker.ErrSkipped) {
 				pace()
@@ -166,7 +171,10 @@ func finishImport(a *app.App, run *takeRun, err, renderErr error) error {
 	}
 
 	errs := []error{err}
-	if err != nil {
+	switch {
+	case err != nil && resume == 0:
+		errs = append(errs, fmt.Errorf("stopped before importing anything from %s, run the same command again to start over", run.queue))
+	case err != nil:
 		errs = append(errs, fmt.Errorf("stopped after line %d of %s, run the same command with --skip %d to continue", resume, run.queue, resume))
 	}
 	if len(failed) > 0 {
