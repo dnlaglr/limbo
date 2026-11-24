@@ -3,49 +3,69 @@ package cli
 import (
 	"context"
 	"errors"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/dnlaglr/limbo/internal/broker"
 )
 
-type fakeReplayer struct {
+type fakeTaker struct {
 	fakeDriver
-	results   []broker.Replayed
-	replayErr error
-	opts      *broker.ReplayOptions
+	took    int
+	removed []string
+	takeErr error
 }
 
-func (f *fakeReplayer) Replay(_ context.Context, queue string, opts broker.ReplayOptions, each func(broker.Replayed)) error {
-	f.queue, f.opts = queue, &opts
-	for _, r := range f.results {
-		each(r)
+func (f *fakeTaker) Take(_ context.Context, queue string, n int, visit func(broker.Message, func() error) (bool, error)) error {
+	f.queue, f.took = queue, n
+	for _, m := range f.msgs[:min(n, len(f.msgs))] {
+		more, err := visit(m, func() error { f.removed = append(f.removed, m.ID); return nil })
+		if err != nil || !more {
+			return err
+		}
 	}
 
-	return f.replayErr
+	return f.takeErr
 }
 
-func replayer(depth int, results ...broker.Replayed) *fakeReplayer {
-	return &fakeReplayer{fakeDriver: fakeDriver{depths: map[string]int{"orders.dlq": depth, "orders.v2": 0}}, results: results}
+type fakeReplayer struct {
+	fakeTaker
+	published []string
+	refuse    map[string]error
+}
+
+func (f *fakeReplayer) Publish(_ context.Context, to string, m broker.Message) error {
+	if err := f.refuse[to]; err != nil {
+		return err
+	}
+	f.published = append(f.published, m.ID+">"+to)
+
+	return nil
+}
+
+func replayer(depth int, msgs ...broker.Message) *fakeReplayer {
+	return &fakeReplayer{fakeTaker: fakeTaker{fakeDriver: fakeDriver{msgs: msgs, depths: map[string]int{"orders.dlq": depth, "orders.v2": 0}}}}
+}
+
+func diedIn(id, queue string) broker.Message {
+	return broker.Message{ID: id, Queue: "orders.dlq", Deaths: []broker.Death{{Queue: queue, Reason: "rejected", Count: 1}}}
 }
 
 var orphan = broker.Message{ID: "7d3e9b01", Queue: "orders.dlq"}
 
 func TestReplayText(t *testing.T) {
-	d := replayer(9,
-		broker.Replayed{Message: rejectedOrder, To: "orders"},
-		broker.Replayed{Message: rejectedOrder, To: "orders"},
-		broker.Replayed{Message: rejectedOrder, To: "pay\x1b[2Jments"},
-		broker.Replayed{Message: orphan, Err: broker.ErrNoOrigin},
-	)
+	d := replayer(9, rejectedOrder, rejectedOrder, diedIn("p1", "pay\x1b[2Jments"), orphan)
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--yes", "-n", "4")
 	if code != exitError {
 		t.Fatalf("exit code = %d, want %d for a partial replay; stderr:\n%s", code, exitError, errOut)
 	}
-	if d.opts == nil || !reflect.DeepEqual(*d.opts, broker.ReplayOptions{Selection: broker.Selection{Limit: 4, Scan: 4}}) || d.queue != "orders.dlq" || !d.closed {
-		t.Errorf("driver got queue %q, options %+v, closed %v", d.queue, d.opts, d.closed)
+	if d.took != 4 || d.queue != "orders.dlq" || !d.closed {
+		t.Errorf("driver took %d from queue %q, closed %v; want 4 from orders.dlq", d.took, d.queue, d.closed)
+	}
+	if want := []string{"4f1c2a7e>orders", "4f1c2a7e>orders", "p1>pay\x1b[2Jments"}; !slices.Equal(d.published, want) || !slices.Equal(d.removed, []string{"4f1c2a7e", "4f1c2a7e", "p1"}) {
+		t.Errorf("published %q and removed %q, want %q and the same three removed", d.published, d.removed, want)
 	}
 
 	for _, want := range []string{"Replayed", "orders ×2", "pay[2Jments ×1", "Returned", broker.ErrNoOrigin.Error() + " ×1"} {
@@ -64,10 +84,8 @@ func TestReplayText(t *testing.T) {
 }
 
 func TestReplayJSON(t *testing.T) {
-	d := replayer(2,
-		broker.Replayed{Message: rejectedOrder, To: "orders"},
-		broker.Replayed{Message: orphan, To: "orders.v1", Err: errors.New(`no queue named "orders.v1"`)},
-	)
+	d := replayer(2, rejectedOrder, diedIn(orphan.ID, "orders.v1"))
+	d.refuse = map[string]error{"orders.v1": errors.New(`no queue named "orders.v1"`)}
 
 	code, out, _ := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "-y", "-o", "json")
 	want := `{"id":"4f1c2a7e","to":"orders","status":"replayed"}` + "\n" +
@@ -78,24 +96,23 @@ func TestReplayJSON(t *testing.T) {
 }
 
 func TestReplayNeedsConfirmation(t *testing.T) {
-	d := replayer(3)
+	d := replayer(3, rejectedOrder)
 
 	code, _, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x")
 	if code != exitError || !strings.Contains(strings.ToLower(errOut), "refusing to replay without confirmation: pass --yes, or --dry-run to preview") {
 		t.Errorf("exit code %d, stderr:\n%s\nwant a refusal without a terminal", code, errOut)
 	}
-	if d.opts != nil {
+	if d.took != 0 {
 		t.Error("replayed without confirmation")
 	}
 }
 
 func TestReplayDryRun(t *testing.T) {
-	d := replayer(3)
-	d.msgs = []broker.Message{rejectedOrder, orphan, expiredPayment}
+	d := replayer(3, rejectedOrder, orphan, expiredPayment)
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--dry-run", "--not-reason", "expired")
-	if code != exitOK || d.opts != nil || d.n != 3 || d.visited != 3 {
-		t.Fatalf("exit code %d, replayed %v, read %d of %d; want a read of 3 and no replay; stderr:\n%s", code, d.opts != nil, d.visited, d.n, errOut)
+	if code != exitOK || d.took != 0 || d.n != 3 || d.visited != 3 {
+		t.Fatalf("exit code %d, took %d, read %d of %d; want a read of 3 and no replay; stderr:\n%s", code, d.took, d.visited, d.n, errOut)
 	}
 
 	for _, want := range []string{"orders.dlq  dry run", "Would replay", "orders ×1", "Would return", broker.ErrNoOrigin.Error() + " ×1", "Skipped", "1 message"} {
@@ -106,18 +123,14 @@ func TestReplayDryRun(t *testing.T) {
 }
 
 func TestReplayFiltered(t *testing.T) {
-	d := replayer(3,
-		broker.Replayed{Message: orphan, Err: broker.ErrSkipped},
-		broker.Replayed{Message: rejectedOrder, To: "orders"},
-		broker.Replayed{Message: expiredPayment, Err: broker.ErrSkipped},
-	)
+	d := replayer(3, orphan, rejectedOrder, expiredPayment)
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "-y", "--from", "orders", "-o", "json")
 	if code != exitOK {
 		t.Fatalf("exit code = %d, want %d when messages were only skipped; stderr:\n%s", code, exitOK, errOut)
 	}
-	if d.visited != 0 || d.opts == nil || d.opts.Scan != 3 || d.opts.Limit != 0 || len(d.opts.Filter.Sources.Any) != 1 {
-		t.Errorf("read %d messages first and replayed with %+v; want one filtered pass over all 3", d.visited, d.opts)
+	if d.visited != 0 || d.took != 3 || !slices.Equal(d.published, []string{"4f1c2a7e>orders"}) {
+		t.Errorf("read %d messages first, took %d and published %q; want one filtered pass over all 3", d.visited, d.took, d.published)
 	}
 	if want := `{"id":"4f1c2a7e","to":"orders","status":"replayed"}` + "\n"; out != want {
 		t.Errorf("stdout =\n%s\nwant only the replayed message\n%s", out, want)
@@ -125,7 +138,7 @@ func TestReplayFiltered(t *testing.T) {
 }
 
 func TestReplayAllSkipped(t *testing.T) {
-	d := replayer(2, broker.Replayed{Message: orphan, Err: broker.ErrSkipped}, broker.Replayed{Message: expiredPayment, Err: broker.ErrSkipped})
+	d := replayer(2, orphan, expiredPayment)
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--yes", "--reason", "rejected")
 	if code != exitOK || !strings.Contains(out, "Skipped") || !strings.Contains(out, "2 messages") || strings.Contains(out, "Not reached") {
@@ -134,8 +147,8 @@ func TestReplayAllSkipped(t *testing.T) {
 }
 
 func TestReplayInterrupted(t *testing.T) {
-	d := replayer(5, broker.Replayed{Message: rejectedOrder, To: "orders"})
-	d.replayErr = context.Canceled
+	d := replayer(5, rejectedOrder)
+	d.takeErr = context.Canceled
 
 	code, out, errOut := runWith(t, fakeBrokers(d), "replay", "orders.dlq", "--url", "fake://x", "--yes")
 	if code != exitCanceled {
@@ -152,8 +165,8 @@ func TestReplayInterrupted(t *testing.T) {
 }
 
 func TestReplayErrors(t *testing.T) {
-	lost := replayer(3, broker.Replayed{Message: rejectedOrder, To: "orders"})
-	lost.replayErr = errors.New("connection reset by peer")
+	lost := replayer(3, rejectedOrder)
+	lost.takeErr = errors.New("connection reset by peer")
 
 	tests := []struct {
 		name   string

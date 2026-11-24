@@ -3,7 +3,9 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -57,53 +59,97 @@ func TestRegistryOpen(t *testing.T) {
 	}
 }
 
-func TestReplayRun(t *testing.T) {
-	died := func(id, queue string) Message { return Message{ID: id, Deaths: []Death{{Queue: queue}}} }
-	refused, errRemove := errors.New("refused"), errors.New("remove failed")
+type fakeQueue struct {
+	msgs       []Message
+	refuse     map[string]error
+	failRemove string
+	log        []string
+}
 
-	type step struct {
-		m                  Message
-		sendErr, removeErr error
-		want               string
-		sent, removed      bool
-		more               bool
-		err                error
+func (f *fakeQueue) Take(_ context.Context, _ string, n int, visit func(Message, func() error) (bool, error)) error {
+	for _, m := range f.msgs[:min(n, len(f.msgs))] {
+		more, err := visit(m, func() error {
+			f.log = append(f.log, "remove "+m.ID)
+			if m.ID == f.failRemove {
+				return errRemove
+			}
+			return nil
+		})
+		if err != nil || !more {
+			return err
+		}
 	}
+
+	return nil
+}
+
+func (f *fakeQueue) Publish(_ context.Context, to string, m Message) error {
+	f.log = append(f.log, "publish "+m.ID+">"+to)
+	return f.refuse[to]
+}
+
+var errRemove = errors.New("remove failed")
+
+func TestTake(t *testing.T) {
+	died := func(id, queue string) Message { return Message{ID: id, Deaths: []Death{{Queue: queue}}} }
+	refused := errors.New("refused")
+	timeout := fmt.Errorf("no confirm: %w", context.DeadlineExceeded)
+	notPayments := Filter{Sources: Rule[string]{None: []string{"payments"}}}
+	a, b, o, p := died("a", "orders"), died("b", "orders"), Message{ID: "o"}, died("p", "payments")
+
 	tests := []struct {
-		name  string
-		limit int
-		steps []step
+		name       string
+		msgs       []Message
+		filter     Filter
+		limit      int
+		refuse     map[string]error
+		failRemove string
+		wantLog    []string
+		want       []string
+		wantErr    error
 	}{
-		{"filtered", 3, []step{
-			{m: died("p", "payments"), want: "p →  ✗ " + ErrSkipped.Error(), more: true},
-			{m: Message{ID: "o"}, want: "o →  ✗ " + ErrNoOrigin.Error(), more: true},
-			{m: died("a", "orders"), sendErr: refused, want: "a → orders ✗ refused", sent: true, more: true},
-			{m: died("b", "orders"), removeErr: errRemove, want: "b → orders", sent: true, removed: true, err: errRemove},
-		}},
-		{"limit", 1, []step{
-			{m: died("c", "orders"), want: "c → orders", sent: true, removed: true},
-		}},
+		{
+			name: "replay", msgs: []Message{a, o, p}, filter: notPayments,
+			wantLog: []string{"publish a>orders", "remove a"},
+			want:    []string{"a → orders", "o →  ✗ " + ErrNoOrigin.Error(), "p →  ✗ " + ErrSkipped.Error()},
+		},
+		{
+			name: "refused", msgs: []Message{a, p}, refuse: map[string]error{"orders": refused},
+			wantLog: []string{"publish a>orders", "publish p>payments", "remove p"},
+			want:    []string{"a → orders ✗ refused", "p → payments"},
+		},
+		{
+			name: "timeout", msgs: []Message{a, b}, refuse: map[string]error{"orders": timeout},
+			wantLog: []string{"publish a>orders"},
+			want:    []string{"a → orders ✗ " + timeout.Error()}, wantErr: context.DeadlineExceeded,
+		},
+		{
+			name: "failed remove", msgs: []Message{a, b}, failRemove: "a",
+			wantLog: []string{"publish a>orders", "remove a"},
+			want:    []string{"a → orders"}, wantErr: errRemove,
+		},
+		{
+			name: "limit", msgs: []Message{a, b}, limit: 1,
+			wantLog: []string{"publish a>orders", "remove a"},
+			want:    []string{"a → orders"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var got string
-			opts := ReplayOptions{Selection: Selection{Filter: Filter{Sources: Rule[string]{None: []string{"payments"}}}, Limit: tt.limit}}
-			run := opts.Start(func(r Replayed) {
-				got = r.Message.ID + " → " + r.To
+			q := &fakeQueue{msgs: tt.msgs, refuse: tt.refuse, failRemove: tt.failRemove}
+			sel := Selection{Filter: tt.filter, Limit: tt.limit, Scan: len(tt.msgs)}
+			var got []string
+			each := func(r Taken) {
+				s := r.Message.ID + " → " + r.To
 				if r.Err != nil {
-					got += " ✗ " + r.Err.Error()
+					s += " ✗ " + r.Err.Error()
 				}
-			})
+				got = append(got, s)
+			}
 
-			for _, s := range tt.steps {
-				sent, removed := false, false
-				_, more, err := run.Next(s.m,
-					func(string) error { sent = true; return s.sendErr },
-					func() error { removed = true; return s.removeErr })
-				if got != s.want || sent != s.sent || removed != s.removed || more != s.more || !errors.Is(err, s.err) {
-					t.Errorf("Next(%s) reported %q, sent %v, removed %v, more %v, err %v; want %q, %v, %v, %v, %v",
-						s.m.ID, got, sent, removed, more, err, s.want, s.sent, s.removed, s.more, s.err)
-				}
+			err := Replay(context.Background(), q, "dlq", ReplayOptions{Selection: sel}, each)
+			if !slices.Equal(q.log, tt.wantLog) || !slices.Equal(got, tt.want) || !errors.Is(err, tt.wantErr) || (tt.wantErr == nil) != (err == nil) {
+				t.Errorf("did %q, reported %q, err %v; want %q, %q, %v", q.log, got, err, tt.wantLog, tt.want, tt.wantErr)
 			}
 		})
 	}

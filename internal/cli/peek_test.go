@@ -68,6 +68,7 @@ var (
 		Timestamp:     publishedAt,
 		DeliveryCount: 18,
 		Headers:       map[string]any{"tenant": "acme"},
+		Properties:    map[string]any{"app_id": "shop"},
 		Deaths: []broker.Death{
 			{Queue: "orders", Reason: "rejected", Count: 3, Time: rejectedAt, Exchange: "shop", RoutingKeys: []string{"order.created"}},
 		},
@@ -79,6 +80,11 @@ var (
 		Deaths: []broker.Death{{Queue: "payments", Reason: "expired", Count: 1, Time: rejectedAt.Add(-time.Hour)}},
 	}
 )
+
+const rejectedOrderJSON = `{"id":"4f1c2a7e","queue":"orders.dlq","content_type":"application/json","timestamp":"2026-11-18T14:02:11Z",` +
+	`"delivery_count":18,"headers":{"tenant":"acme"},"properties":{"app_id":"shop"},"deaths":[{"queue":"orders","reason":"rejected","count":3,` +
+	`"time":"2026-11-18T14:05:40Z","exchange":"shop","routing_keys":["order.created"]}],` +
+	`"body":"{\"orderId\":1042}","body_encoding":"utf-8"}`
 
 func TestPeekText(t *testing.T) {
 	hostile := broker.Message{Queue: "orders.dlq", Body: []byte("\x1b]0;pwned\x07 hello")}
@@ -129,11 +135,7 @@ func TestPeekJSON(t *testing.T) {
 		t.Fatalf("exit code = %d, stderr:\n%s", code, errOut)
 	}
 
-	want := `{"id":"4f1c2a7e","queue":"orders.dlq","content_type":"application/json","timestamp":"2026-11-18T14:02:11Z",` +
-		`"delivery_count":18,"headers":{"tenant":"acme"},"deaths":[{"queue":"orders","reason":"rejected","count":3,` +
-		`"time":"2026-11-18T14:05:40Z","exchange":"shop","routing_keys":["order.created"]}],` +
-		`"body":"{\"orderId\":1042}","body_encoding":"utf-8"}` + "\n" +
-		`{"queue":"orders.dlq","body":"/wAB","body_encoding":"base64"}` + "\n"
+	want := rejectedOrderJSON + "\n" + `{"queue":"orders.dlq","body":"/wAB","body_encoding":"base64"}` + "\n"
 	if out != want {
 		t.Errorf("stdout =\n%s\nwant\n%s", out, want)
 	}
