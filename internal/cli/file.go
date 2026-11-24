@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"os"
 	"strings"
 	"time"
@@ -109,4 +112,99 @@ func (f *messageFile) name() string {
 	}
 
 	return f.path
+}
+
+// A messageSource reads an export or backup file, from the line after skip, and is checked whole before anything is published
+type messageSource struct {
+	path  string
+	skip  int
+	count int
+}
+
+func readFile(path string, skip int) (*messageSource, error) {
+	src := &messageSource{path: path, skip: skip}
+	err := src.each(func(int, broker.Message) bool {
+		src.count++
+		return true
+	})
+
+	return src, err
+}
+
+// Lines are read whole, however long a message is, and blank lines count toward line numbers but hold no message
+func (s *messageSource) each(visit func(line int, m broker.Message) bool) error {
+	f, err := os.Open(s.path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := bufio.NewReader(f)
+	for line := 1; ; line++ {
+		b, err := r.ReadBytes('\n')
+		if line == 1 {
+			b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+		}
+		if b = bytes.TrimRight(b, "\r\n"); line > s.skip && len(bytes.TrimSpace(b)) > 0 {
+			m, decodeErr := decodeLine(b)
+			if decodeErr != nil {
+				return fmt.Errorf("line %d of %s: %w", line, s.path, decodeErr)
+			}
+			if !visit(line, m) {
+				return nil
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// messages yields each message for a run, which learns the line it came from
+func (s *messageSource) messages(run *takeRun) iter.Seq2[broker.Message, error] {
+	return func(yield func(broker.Message, error) bool) {
+		if err := s.each(func(line int, m broker.Message) bool {
+			run.line = line
+			return yield(m, nil)
+		}); err != nil {
+			yield(broker.Message{}, err)
+		}
+	}
+}
+
+// read previews a run the way browse does for a queue, keeping each message that matches until the limit
+func (s *messageSource) read(run *takeRun) func(keep func(broker.Message) error) (int, error) {
+	return func(keep func(broker.Message) error) (int, error) {
+		scanned, matched := 0, 0
+		var kept error
+		err := s.each(func(line int, m broker.Message) bool {
+			scanned, run.line = scanned+1, line
+			if run.sel.Filter.Match(m) {
+				matched++
+				kept = keep(m)
+			}
+			return kept == nil && !run.sel.Full(matched)
+		})
+
+		return scanned, errors.Join(kept, err)
+	}
+}
+
+func decodeLine(b []byte) (broker.Message, error) {
+	var probe struct {
+		Version *int `json:"version"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil || probe.Version == nil {
+		return broker.Message{}, errors.New("isn't a limbo export record")
+	}
+	if *probe.Version != fileVersion {
+		return broker.Message{}, fmt.Errorf("has version %d, which this limbo can't read", *probe.Version)
+	}
+
+	var m broker.Message
+	err := json.Unmarshal(b, &m)
+	return m, err
 }

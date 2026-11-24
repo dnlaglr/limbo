@@ -2,11 +2,14 @@ package rabbitmq
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -206,16 +209,25 @@ func (p *publisher) publish(queue string, msg amqp.Publishing) error {
 }
 
 func republishing(m broker.Message, now time.Time) amqp.Publishing {
-	headers := withoutDeathHeaders(m.Headers)
+	headers := restore(withoutDeathHeaders(m.Headers), broker.StringMap(m.Properties["header_types"]))
 	if headers == nil {
 		headers = amqp.Table{}
 	}
 	delete(headers, "x-acquired-count")
-	headers[replayCountHeader] = int64(toInt(m.Headers[replayCountHeader]) + 1)
+	headers[replayCountHeader] = int64(toInt(headers[replayCountHeader]) + 1)
 	headers[replayedAtHeader] = now
 
 	str := func(k string) string { s, _ := m.Properties[k].(string); return s }
-	num := func(k string) uint8 { n, _ := m.Properties[k].(uint8); return n }
+	num := func(k string) uint8 {
+		switch n := m.Properties[k].(type) {
+		case uint8:
+			return n
+		case json.Number:
+			v, _ := strconv.ParseUint(n.String(), 10, 8)
+			return uint8(v)
+		}
+		return 0
+	}
 
 	return amqp.Publishing{
 		Headers:         headers,
@@ -233,6 +245,112 @@ func republishing(m broker.Message, now time.Time) amqp.Publishing {
 		AppId:           str("app_id"),
 		Body:            m.Body,
 	}
+}
+
+// A message read back from a file holds JSON values, so each header gets the AMQP type header_types names, or one RabbitMQ accepts
+// Native values from the queue pass through unchanged, and a value that won't convert stays as it is for the broker to refuse
+func restore(headers amqp.Table, types map[string]string) amqp.Table {
+	for k, v := range headers {
+		headers[k] = typed(types[k], v)
+	}
+
+	return headers
+}
+
+func typed(t string, v any) any {
+	switch v := v.(type) {
+	case json.Number:
+		return number(t, v)
+	case string:
+		if at, err := time.Parse(time.RFC3339Nano, v); t == "timestamp" && err == nil {
+			return at
+		}
+		if b, err := base64.StdEncoding.DecodeString(v); t == "bytes" && err == nil {
+			return b
+		}
+	case map[string]any:
+		if t == "decimal" {
+			scale, okScale := number("uint8", v["Scale"]).(uint8)
+			value, okValue := number("int32", v["Value"]).(int32)
+			if okScale && okValue {
+				return amqp.Decimal{Scale: scale, Value: value}
+			}
+			return v
+		}
+		table := amqp.Table{}
+		for k, e := range v {
+			table[k] = typed("", e)
+		}
+		return table
+	case []any:
+		items := make([]any, len(v))
+		for i, e := range v {
+			items[i] = typed("", e)
+		}
+		return items
+	}
+
+	return v
+}
+
+// A number that doesn't fit its recorded type is returned as it is, and without a type a whole number becomes int64 and
+// any other number float64
+func number(t string, v any) any {
+	n, ok := v.(json.Number)
+	if !ok {
+		return v
+	}
+
+	s, bits := n.String(), 0
+	if t != "" {
+		bits, _ = strconv.Atoi(strings.TrimLeft(t, "afilnotu"))
+	}
+	switch t {
+	case "int8", "int16", "int32", "int64":
+		i, err := strconv.ParseInt(s, 10, bits)
+		if err != nil {
+			return n
+		}
+		switch t {
+		case "int8":
+			return int8(i)
+		case "int16":
+			return int16(i)
+		case "int32":
+			return int32(i)
+		}
+		return i
+	case "uint8", "uint16", "uint32":
+		u, err := strconv.ParseUint(s, 10, bits)
+		if err != nil {
+			return n
+		}
+		switch t {
+		case "uint8":
+			return uint8(u)
+		case "uint16":
+			return uint16(u)
+		}
+		return uint32(u)
+	case "float32", "float64":
+		f, err := strconv.ParseFloat(s, bits)
+		if err != nil {
+			return n
+		}
+		if t == "float32" {
+			return float32(f)
+		}
+		return f
+	}
+
+	if i, err := n.Int64(); err == nil {
+		return i
+	}
+	if f, err := n.Float64(); err == nil {
+		return f
+	}
+
+	return n
 }
 
 // Properties hold what limbo doesn't model but needs to publish an identical copy, from a file as well as from the queue

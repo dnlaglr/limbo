@@ -26,12 +26,14 @@ type takeOptions struct {
 	filter filterOptions
 }
 
-type verb struct{ base, past, doing string }
+// A message a command can't take goes back to its queue, but an import's stays in the file, so the word for it differs
+type verb struct{ base, past, doing, fail, failed string }
 
 var (
-	replaying = verb{"replay", "replayed", "Replaying"}
-	deleting  = verb{"delete", "deleted", "Deleting"}
-	purging   = verb{"purge", "purged", "Purging"}
+	replaying = verb{"replay", "replayed", "Replaying", "return", "returned"}
+	deleting  = verb{"delete", "deleted", "Deleting", "return", "returned"}
+	purging   = verb{"purge", "purged", "Purging", "return", "returned"}
+	importing = verb{"import", "imported", "Importing", "fail", "failed"}
 )
 
 // A taker is what a command does with the messages it takes, picked once limbo knows what the broker supports
@@ -54,9 +56,15 @@ type takeRun struct {
 	verb    verb
 	routed  bool
 	backup  string
+
+	// A run that reads a file keeps the line each result came from, and the last line it reported, so it can say where to resume
+	line  int
+	last  int
+	lines []int
 }
 
 type takeRecord struct {
+	Line   int    `json:"line,omitempty"`
 	ID     string `json:"id,omitempty"`
 	To     string `json:"to,omitempty"`
 	Status string `json:"status"`
@@ -116,17 +124,9 @@ func runTake(ctx context.Context, a *app.App, in io.Reader, queue string, opts t
 	if t.purge != nil && !opts.dryRun {
 		return purgeAll(ctx, a, in, t, run, opts)
 	}
-	if opts.dryRun || !run.sel.Filter.IsZero() && !opts.yes {
-		if err := plan(ctx, a, d, run, t.target); err != nil {
-			return err
-		}
-		if opts.dryRun {
-			return render(a, run)
-		}
-		if len(run.results) == 0 {
-			a.UI.Info("No messages in " + queue + " matched")
-			return nil
-		}
+	read := func(keep func(broker.Message) error) (int, error) { return browse(ctx, a, d, queue, run.sel, keep) }
+	if done, err := preview(a, run, opts, render, t.target, read); done {
+		return err
 	}
 
 	if !opts.yes {
@@ -158,14 +158,38 @@ func newTakeRun(queue string, depth int, opts takeOptions, v verb) *takeRun {
 	return run
 }
 
+// A dry run, or a filtered run that will ask, is planned first, and done reports that nothing is left to take
+func preview(a *app.App, run *takeRun, opts takeOptions, render func(*app.App, *takeRun) error, target func(broker.Message) (string, error),
+	read func(keep func(broker.Message) error) (int, error),
+) (done bool, err error) {
+	if !opts.dryRun && (run.sel.Filter.IsZero() || opts.yes) {
+		return false, nil
+	}
+	if err := plan(run, target, read); err != nil {
+		return true, err
+	}
+	if opts.dryRun {
+		return true, render(a, run)
+	}
+	if len(run.results) == 0 {
+		a.UI.Info("No messages in " + run.queue + " matched")
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // The run that follows a plan covers only the messages the plan read and takes no more than it matched
-func plan(ctx context.Context, a *app.App, d broker.Driver, run *takeRun, target func(broker.Message) (string, error)) error {
-	scanned, err := browse(ctx, a, d, run.queue, run.sel, func(m broker.Message) error {
+func plan(run *takeRun, target func(broker.Message) (string, error), read func(keep func(broker.Message) error) (int, error)) error {
+	scanned, err := read(func(m broker.Message) error {
 		r := broker.Taken{Message: m}
 		if target != nil {
 			r.To, r.Err = target(m)
 		}
 		run.results = append(run.results, r)
+		if run.line > 0 {
+			run.lines = append(run.lines, run.line)
+		}
 		return nil
 	})
 
@@ -188,14 +212,18 @@ func confirm(ctx context.Context, a *app.App, in io.Reader, question string, v v
 }
 
 func takeAll(ctx context.Context, a *app.App, t *taker, run *takeRun) error {
-	run.results, run.skipped = nil, 0
+	run.results, run.skipped, run.lines = nil, 0, nil
 	title := fmt.Sprintf("%s %s from %s", run.verb.doing, run.subject, run.queue)
 	return a.UI.Progress(ctx, title, func(ctx context.Context, set func(float64)) error {
 		return t.take(ctx, run, func(res broker.Taken) {
+			run.last = max(run.last, run.line)
 			if errors.Is(res.Err, broker.ErrSkipped) {
 				run.skipped++
 			} else {
 				run.results = append(run.results, res)
+				if run.line > 0 {
+					run.lines = append(run.lines, run.line)
+				}
 			}
 			set(float64(len(run.results)+run.skipped) / float64(run.sel.Scan))
 		})
@@ -249,9 +277,9 @@ func finish(a *app.App, run *takeRun, note string, err, renderErr error) error {
 }
 
 func renderTakeText(a *app.App, run *takeRun) error {
-	title, doneKey, returnedKey := run.queue, capitalize(run.verb.past), "Returned"
+	title, doneKey, returnedKey := run.queue, capitalize(run.verb.past), capitalize(run.verb.failed)
 	if run.dryRun {
-		title, doneKey, returnedKey = run.queue+"  dry run", "Would "+run.verb.base, "Would return"
+		title, doneKey, returnedKey = run.queue+"  dry run", "Would "+run.verb.base, "Would "+run.verb.fail
 	}
 
 	var done, returned []string
@@ -287,8 +315,11 @@ func renderTakeText(a *app.App, run *takeRun) error {
 
 func renderTakeJSON(a *app.App, run *takeRun) error {
 	enc := json.NewEncoder(a.UI.Out())
-	for _, r := range run.results {
+	for i, r := range run.results {
 		rec := takeRecord{ID: r.Message.ID, To: r.To, Status: status(run.verb, r.Err == nil, run.dryRun)}
+		if i < len(run.lines) {
+			rec.Line = run.lines[i]
+		}
 		if r.Err != nil {
 			rec.Error = r.Err.Error()
 		}
@@ -307,10 +338,10 @@ func status(v verb, done, dryRun bool) string {
 	case done:
 		return v.past
 	case dryRun:
-		return "would_return"
+		return "would_" + v.fail
 	}
 
-	return "returned"
+	return v.failed
 }
 
 func tally(values []string) string {

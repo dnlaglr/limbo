@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"os"
@@ -201,6 +202,18 @@ func TestSendInput(t *testing.T) {
 		"sig":     {DataType: aws.String("Binary"), BinaryValue: []byte{1, 2}},
 	}, "1"))
 
+	fromRabbitMQ := message(map[string]any{
+		"attempt":       json.Number("3"),
+		"vip":           true,
+		"trace":         map[string]any{"hop": json.Number("1")},
+		replayCountAttr: json.Number("2"),
+	}, nil)
+	wantFromRabbitMQ := input(marked(map[string]types.MessageAttributeValue{
+		"attempt": attr("Number", "3"),
+		"vip":     attr("String", "true"),
+		"trace":   attr("String", `{"hop":1}`),
+	}, "3"))
+
 	tests := []struct {
 		name string
 		to   string
@@ -210,6 +223,8 @@ func TestSendInput(t *testing.T) {
 		{"fifo", "orders.fifo", replayedFIFO, wantFIFO},
 		{"standard", "orders", message(nil, nil), input(marked(userAttrs(0), "1"))},
 		{"typed attributes", "orders", typed, wantTyped},
+		{"typed attributes from a file", "orders", viaFile(t, typed), wantTyped},
+		{"from a RabbitMQ file", "orders", fromRabbitMQ, wantFromRabbitMQ},
 		{"eight attributes", "orders", message(userHeaders(8), nil), input(marked(userAttrs(8), "1"))},
 		{"nine attributes", "orders", message(userHeaders(9), nil), input(userAttrs(9))},
 	}
@@ -379,6 +394,75 @@ func TestPurge(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestImportRoundTrip(t *testing.T) {
+	for _, kind := range []string{"standard", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, fifo := context.Background(), kind == "fifo"
+			d := connect(t)
+			base := "limbo-test-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			from, to := queueName(base, fifo), queueName(base+"-imported", fifo)
+			fromURL := createQueue(t, d, from, map[string]string{})
+			createQueue(t, d, to, map[string]string{})
+
+			in := &awssqs.SendMessageInput{QueueUrl: &fromURL, MessageBody: aws.String("m0"), MessageAttributes: map[string]types.MessageAttributeValue{
+				"tenant":  {DataType: aws.String("String"), StringValue: aws.String("acme")},
+				"attempt": {DataType: aws.String("Number"), StringValue: aws.String("3")},
+				"price":   {DataType: aws.String("Number.float"), StringValue: aws.String("9.50")},
+				"sig":     {DataType: aws.String("Binary"), BinaryValue: []byte{1, 2}},
+			}}
+			if fifo {
+				in.MessageGroupId, in.MessageDeduplicationId = aws.String("g"), aws.String("m0")
+			}
+			if _, err := d.client.SendMessage(ctx, in); err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, d, from, 1)
+			original := browseOne(t, d, from)
+
+			err := broker.Import(ctx, d, func(yield func(broker.Message, error) bool) { yield(viaFile(t, original), nil) },
+				broker.ReplayOptions{To: to}, func(broker.Taken) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, d, to, 1)
+
+			copied := browseOne(t, d, to)
+			delete(copied.Headers, replayCountAttr)
+			delete(copied.Headers, replayedAtAttr)
+			delete(copied.Properties[attributeTypes].(map[string]string), replayCountAttr)
+			if string(copied.Body) != "m0" || !reflect.DeepEqual(copied.Headers, original.Headers) || !reflect.DeepEqual(copied.Properties, original.Properties) {
+				t.Errorf("imported copy has headers %#v and properties %#v, want the original's %#v and %#v", copied.Headers, copied.Properties, original.Headers, original.Properties)
+			}
+		})
+	}
+}
+
+// Writes m as an export file line would and reads it back
+func viaFile(t *testing.T, m broker.Message) broker.Message {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded broker.Message
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+
+	return decoded
+}
+
+func browseOne(t *testing.T, d *driver, queue string) broker.Message {
+	t.Helper()
+	var got broker.Message
+	if err := d.Browse(context.Background(), queue, 1, func(m broker.Message) bool { got = m; return false }); err != nil {
+		t.Fatal(err)
+	}
+
+	return got
 }
 
 func firstN(n int) broker.ReplayOptions {
