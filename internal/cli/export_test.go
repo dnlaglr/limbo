@@ -61,7 +61,7 @@ func TestExportNeverOverwrites(t *testing.T) {
 	d := browsing(rejectedOrder)
 
 	code, _, errOut := runWith(t, fakeBrokers(d), "export", "orders.dlq", "--url", "fake://x", "--file", path)
-	if got, _ := os.ReadFile(path); code != exitError || !strings.Contains(errOut, "already exists") || string(got) != "old" || d.visited != 0 {
+	if got, _ := os.ReadFile(path); code != exitError || !strings.Contains(squash(errOut), "alreadyexists") || string(got) != "old" || d.visited != 0 {
 		t.Errorf("exit code %d, file %q, read %d; stderr:\n%s\nwant a refusal that leaves the file alone", code, got, d.visited, errOut)
 	}
 }

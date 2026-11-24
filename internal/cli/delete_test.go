@@ -112,15 +112,22 @@ func TestDeleteBackupUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The operating system words a missing folder its own way, so the expected reason comes from the same failed open
+	missing := filepath.Join(dir, "missing", "b.ndjson")
+	_, openErr := os.OpenFile(missing, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if openErr == nil {
+		t.Fatal("created a file in a missing folder")
+	}
+
 	tests := []struct{ name, path, why string }{
-		{"missing folder", filepath.Join(dir, "missing", "b.ndjson"), "no such file or directory"},
+		{"missing folder", missing, errors.Unwrap(openErr).Error()},
 		{"existing file", existing, "already exists"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := taking(rejectedOrder)
 			code, _, errOut := runWith(t, fakeBrokers(d), "delete", "orders.dlq", "--url", "fake://x", "--id", "4f1c2a7e", "--yes", "--backup", tt.path)
-			if code != exitError || d.took != 0 || len(d.removed) != 0 || !strings.Contains(errOut, tt.path) || !strings.Contains(errOut, tt.why) {
+			if code != exitError || d.took != 0 || len(d.removed) != 0 || !strings.Contains(squash(errOut), squash(tt.path)) || !strings.Contains(squash(errOut), squash(tt.why)) {
 				t.Errorf("exit code %d, took %d, removed %q; stderr:\n%s\nwant an error naming %s and %q before anything is read", code, d.took, d.removed, errOut, tt.path, tt.why)
 			}
 		})
