@@ -180,12 +180,15 @@ func TestRepublishingFromFile(t *testing.T) {
 		got := republishing(viaFile(t, broker.Message{
 			ID:         "id-1",
 			Body:       []byte("b"),
-			Headers:    map[string]any{"tenant": "acme", "MessageGroupId": "g", "meta": map[string]any{"n": 1}},
-			Properties: map[string]any{"attribute_types": map[string]string{"n": "Number"}},
+			Headers:    map[string]any{"tenant": "acme", "MessageGroupId": "g", "meta": map[string]any{"n": 1}, replayCountHeader: "2"},
+			Properties: map[string]any{"attribute_types": map[string]string{"n": "Number", replayCountHeader: "Number"}},
 		}), now)
 
 		if !reflect.DeepEqual(got.Headers["meta"], amqp.Table{"n": int64(1)}) || got.Headers.Validate() != nil {
 			t.Errorf("headers = %#v, validate = %v; want meta as amqp.Table{n: int64(1)} and headers RabbitMQ accepts", got.Headers, got.Headers.Validate())
+		}
+		if got.Headers[replayCountHeader] != int64(3) {
+			t.Errorf("%s = %#v, want int64(3), counting on from the SQS copy's replays", replayCountHeader, got.Headers[replayCountHeader])
 		}
 	})
 }

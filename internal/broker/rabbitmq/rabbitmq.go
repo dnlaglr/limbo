@@ -262,11 +262,15 @@ func typed(t string, v any) any {
 	case json.Number:
 		return number(t, v)
 	case string:
-		if at, err := time.Parse(time.RFC3339Nano, v); t == "timestamp" && err == nil {
-			return at
-		}
-		if b, err := base64.StdEncoding.DecodeString(v); t == "bytes" && err == nil {
-			return b
+		switch t {
+		case "timestamp":
+			if at, err := time.Parse(time.RFC3339Nano, v); err == nil {
+				return at
+			}
+		case "bytes":
+			if b, err := base64.StdEncoding.DecodeString(v); err == nil {
+				return b
+			}
 		}
 	case map[string]any:
 		if t == "decimal" {
@@ -480,6 +484,9 @@ func toInt(v any) int {
 		return int(n)
 	case int32:
 		return int(n)
+	case string:
+		i, _ := strconv.Atoi(n)
+		return i
 	}
 
 	return 0
