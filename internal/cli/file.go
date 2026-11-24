@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,36 +117,55 @@ func (f *messageFile) name() string {
 
 // A messageSource reads an export or backup file, from the line after skip, and is checked whole before anything is published
 type messageSource struct {
-	path  string
-	skip  int
-	count int
+	path   string
+	skip   int
+	count  int
+	offset int64
 }
 
-func readFile(path string, skip int) (*messageSource, error) {
-	src := &messageSource{path: path, skip: skip}
-	err := src.each(func(int, broker.Message) bool {
-		src.count++
+func readFile(ctx context.Context, path string, skip int, set func(float64)) (*messageSource, error) {
+	var size int64
+	if info, err := os.Stat(path); err == nil {
+		size = info.Size()
+	}
+
+	src, n := &messageSource{path: path, skip: skip}, 0
+	err := src.each(ctx, func(int, broker.Message) bool {
+		n++
+		set(float64(src.offset) / float64(size))
 		return true
 	})
+	src.count = n
 
 	return src, err
 }
 
 // Lines are read whole, however long a message is, and blank lines count toward line numbers but hold no message
-func (s *messageSource) each(visit func(line int, m broker.Message) bool) error {
+// Once checked, a pass stops at the messages the check counted, so lines appended to a file still being written are never published
+func (s *messageSource) each(ctx context.Context, visit func(line int, m broker.Message) bool) error {
 	f, err := os.Open(s.path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	r := bufio.NewReader(f)
+	r, visited := bufio.NewReader(f), 0
+	s.offset = 0
 	for line := 1; ; line++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		b, err := r.ReadBytes('\n')
+		s.offset += int64(len(b))
 		if line == 1 {
 			b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
 		}
 		if b = bytes.TrimRight(b, "\r\n"); line > s.skip && len(bytes.TrimSpace(b)) > 0 {
+			if s.count > 0 && visited == s.count {
+				return nil
+			}
+			visited++
 			m, decodeErr := decodeLine(b)
 			if decodeErr != nil {
 				return fmt.Errorf("line %d of %s: %w", line, s.path, decodeErr)
@@ -164,9 +184,9 @@ func (s *messageSource) each(visit func(line int, m broker.Message) bool) error 
 }
 
 // messages yields each message for a run, which learns the line it came from
-func (s *messageSource) messages(run *takeRun) iter.Seq2[broker.Message, error] {
+func (s *messageSource) messages(ctx context.Context, run *takeRun) iter.Seq2[broker.Message, error] {
 	return func(yield func(broker.Message, error) bool) {
-		if err := s.each(func(line int, m broker.Message) bool {
+		if err := s.each(ctx, func(line int, m broker.Message) bool {
 			run.line = line
 			return yield(m, nil)
 		}); err != nil {
@@ -176,11 +196,11 @@ func (s *messageSource) messages(run *takeRun) iter.Seq2[broker.Message, error] 
 }
 
 // read previews a run the way browse does for a queue, keeping each message that matches until the limit
-func (s *messageSource) read(run *takeRun) func(keep func(broker.Message) error) (int, error) {
+func (s *messageSource) read(ctx context.Context, run *takeRun) func(keep func(broker.Message) error) (int, error) {
 	return func(keep func(broker.Message) error) (int, error) {
 		scanned, matched := 0, 0
 		var kept error
-		err := s.each(func(line int, m broker.Message) bool {
+		err := s.each(ctx, func(line int, m broker.Message) bool {
 			scanned, run.line = scanned+1, line
 			if run.sel.Filter.Match(m) {
 				matched++

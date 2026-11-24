@@ -165,6 +165,64 @@ func TestImportDryRun(t *testing.T) {
 	}
 }
 
+func TestImportLineNumbers(t *testing.T) {
+	b, err := os.ReadFile(exportFile(t, rejectedOrder, payment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+
+	_, out, errOut := runWith(t, fakeBrokers(replayer(0)), "import", writeLines(t, lines[0], "", lines[1]), "--url", "fake://x", "--dry-run", "-o", "json")
+	want := `{"line":1,"id":"4f1c2a7e","to":"orders","status":"would_import"}` + "\n" +
+		`{"line":3,"id":"p1","to":"payments","status":"would_import"}` + "\n"
+	if out != want {
+		t.Errorf("stdout:\n%s\nwant the blank line counted, as --skip counts it:\n%s\nstderr:\n%s", out, want, errOut)
+	}
+}
+
+func TestMessageSourceStops(t *testing.T) {
+	nop := func(float64) {}
+
+	t.Run("canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := readFile(ctx, exportFile(t, rejectedOrder), 0, nop); !errors.Is(err, context.Canceled) {
+			t.Errorf("readFile() error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("lines appended after the check", func(t *testing.T) {
+		path := exportFile(t, rejectedOrder)
+		src, err := readFile(t.Context(), path, 0, nop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		more, err := os.ReadFile(exportFile(t, payment))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if err == nil {
+			_, err = f.Write(more)
+			err = errors.Join(err, f.Close())
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var ids []string
+		for m, err := range src.messages(t.Context(), &takeRun{}) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, m.ID)
+		}
+		if !slices.Equal(ids, []string{"4f1c2a7e"}) {
+			t.Errorf("messages() = %q, want only the message the check counted", ids)
+		}
+	})
+}
+
 func TestImportFileFormats(t *testing.T) {
 	large := diedIn("large", "orders")
 	large.Body = bytes.Repeat([]byte("a"), 100_000)
@@ -222,7 +280,7 @@ func TestImportErrors(t *testing.T) {
 		{"missing destination", "", []string{"--to", "orders.v3"}, replayer(0), `queue "orders.v3" not found`},
 		{"unsupported broker", "", nil, &fakeDriver{}, "import is not supported for fake:// brokers"},
 		{"negative skip", "", []string{"--skip=-1"}, replayer(0), "skip must be 0 or more"},
-		{"missing file", missing, nil, replayer(0), missing},
+		{"missing file", missing, nil, replayer(0), "open " + missing},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
