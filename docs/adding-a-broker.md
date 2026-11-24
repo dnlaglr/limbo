@@ -4,8 +4,8 @@ limbo reaches every broker through the interfaces in `internal/broker`. To add a
 that implements them and register a URL scheme for it. The `peek`, `stats`, `export`, `replay`, `delete`, `purge` and
 `import` commands, filters included, then work with the new broker without changes.
 
-The RabbitMQ driver (`internal/broker/rabbitmq`) and the SQS driver (`internal/broker/sqs`) are the reference
-implementations.
+The RabbitMQ driver (`internal/broker/rabbitmq`), the SQS driver (`internal/broker/sqs`) and the Redis driver
+(`internal/broker/redis`) are the reference implementations, one for each of the first three models below.
 
 ## How a command reaches a driver
 
@@ -63,8 +63,19 @@ How you implement `Browse` and `Take` depends on how the broker lets you read a 
 ### Readable store
 
 - `Browse` is a range read, so it has nothing to return.
-- `Depth` is usually exact, for example `XLEN` on a Redis stream.
+- `Depth` is usually exact, for example `XLEN` on a Redis stream. Check that the key exists first if the count
+  returns 0 for a missing one, as `XLEN` does.
 - `Take`'s remove deletes the message by its ID.
+- Find the newest ID when `Take` starts, and read no further. A copy that fails back into the same store during the
+  run then gets a newer ID and is never taken twice, with no bookkeeping.
+- Nothing locks what you read, so another client can remove a message between your read and your remove. Treat a
+  remove that finds the message already gone as an error, so `broker.Replay` ends the run: the other client may have
+  copied it too.
+- Make `Publish` fail on a missing destination instead of creating it, as `XADD` does with `NOMKSTREAM`, so a typo in
+  an origin can't send messages where nothing reads them.
+- A store without dead-lettering of its own leaves the shape of a dead-letter entry to the app. Let the user name the
+  fields that hold the body, origin and reason with URL options, and leave `Deaths` empty when they don't, so replay
+  needs `--to` rather than guessing.
 
 ### Log
 
@@ -112,6 +123,9 @@ func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
 	return &driver{client: client}, nil
 }
 ```
+
+If the client library parses URLs itself, take limbo's own options out of the query first and hand it the rest, so
+the library still rejects options it doesn't know. The Redis driver does this with go-redis.
 
 Keep secrets out of the output:
 
@@ -169,6 +183,7 @@ Return the number of messages waiting in the queue. An approximate count is acce
 count, the CLI warns, and `stats` marks its counts as partial.
 
 For a missing queue, return `fmt.Errorf("queue %q not found", queue)` so that every broker reports it the same way.
+If the broker counts a missing queue as empty, as Redis does, check that it exists first.
 
 ### Step 5: Implement Browse
 
@@ -231,7 +246,8 @@ When you implement `Take`, its remove, `Publish` and the copy:
 
 - Read no more than `n` messages. Replay and delete pass the depth counted before the run, so messages that fail again
   and return to the dead-letter queue aren't taken twice. If a copy you published can return within that count, as on
-  SQS, remember the IDs of the copies published during the current `Take` and skip them.
+  SQS, remember the IDs of the copies published during the current `Take` and skip them. Where IDs grow, as on a
+  Redis stream, stop at the newest ID there was when `Take` started instead.
 - Return nil from `Publish` only after the broker confirms it has the copy. Return an error that wraps
   `context.DeadlineExceeded` when you gave up waiting for that confirm, because the copy may have arrived anyway.
   `broker.Replay` then ends the run instead of risking more of the same.
@@ -274,6 +290,8 @@ Brokers: broker.Registry{
 	"amqp":     rabbitmq.Open,
 	"amqps":    rabbitmq.Open,
 	"sqs":      sqs.Open,
+	"redis":    redis.Open,
+	"rediss":   redis.Open,
 	"mybroker": mybroker.Open,
 },
 ```
@@ -332,6 +350,8 @@ Against a real broker or an emulator, test that:
 - A message without dead-letter history fails with `broker.ErrNoOrigin` unless `To` is set.
 - A filtered `broker.Remove` backs up and removes only the matching messages, and leaves the rest in order.
 - `Purge`, if implemented, empties the queue and reports a missing queue.
+- On a readable store, a remove after another client deleted the message ends the run, and a replay into the same
+  store doesn't take its own copies.
 - A message browsed, written as an export line and read back, then published with `broker.Import`, arrives with the
   same body, headers and properties as the original, apart from limbo's markers.
 
@@ -353,8 +373,8 @@ integration test skips, so a missing variable can't pass unnoticed.
 - [ ] `Open` rejects invalid URLs and never prints secrets.
 - [ ] `toMessage` sets `Deaths` with the queue the message failed in first, and `Properties` with what a copy needs.
 - [ ] `Browse` and `Take` return every held message on every path.
-- [ ] `Publish`, if implemented, returns nil only after the broker confirms the copy, and builds it from the message
-  alone.
+- [ ] `Publish`, if implemented, returns nil only after the broker confirms the copy, builds it from the message
+  alone, and fails on a missing destination instead of creating it.
 - [ ] `Purge`, if implemented, is described in the `purge` help and the README.
 - [ ] The scheme is registered in `internal/app/app.go`.
 - [ ] The help text describes what the broker does to messages.

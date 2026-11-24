@@ -26,7 +26,7 @@ import (
 
 const (
 	maxBodyPreview = 1024
-	urlUsage       = "broker URL such as amqp://user:pass@host:5672/vhost or sqs://us-east-1 (default $LIMBO_URL)"
+	urlUsage       = "broker URL such as amqp://user:pass@host:5672/vhost, sqs://us-east-1 or redis://user:pass@host:6379/0 (default $LIMBO_URL)"
 )
 
 type peekOptions struct {

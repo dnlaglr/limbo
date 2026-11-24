@@ -35,9 +35,9 @@ from the file.
 Limbo reads the whole file before it publishes anything, and stops with the line number if a line isn't a record it
 can read. Copies follow replay's rules: they drop the broker's dead-letter headers, carry x-limbo-replay-count and
 x-limbo-replayed-at, and on an SQS FIFO queue use limbo- followed by the message ID as their deduplication ID. They
-keep the body, headers and the broker properties the file records, with their types. A file from the other broker
-imports on a best-effort basis: RabbitMQ takes SQS attributes as string headers, and SQS turns RabbitMQ headers into
-attributes up to its limit of 10.
+keep the body, headers and the broker properties the file records, with their types. A file from another broker
+imports on a best-effort basis: RabbitMQ takes SQS attributes and Redis fields as string headers, SQS turns headers
+into attributes up to its limit of 10, and Redis writes the body to the URL's body field and each header as a field.
 
 Limbo asks before it imports. Pass --yes to skip the question, which is required without a terminal, or --dry-run to
 see where each message would go without publishing anything. If an import stops early, limbo prints the line it

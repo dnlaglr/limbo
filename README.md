@@ -15,7 +15,7 @@
 **Get failed messages out of limbo. Safely.**
 
 A single binary for inspecting, triaging, replaying and cleaning up dead-letter queue messages, with the same workflow
-for RabbitMQ and Amazon SQS. More brokers are planned.
+for RabbitMQ, Amazon SQS and Redis streams. More brokers are planned.
 
 - `limbo peek` shows what is in a dead-letter queue and leaves every message there.
 - `limbo stats` counts the messages and tells you when and why they died.
@@ -93,6 +93,31 @@ emulator such as ElasticMQ, or at another SQS endpoint.
 Credentials come from the standard AWS chain: environment variables, a shared profile (`AWS_PROFILE`), SSO, or a
 container or instance role. Limbo rejects credentials in the URL. Name queues by their name, not their URL. Limbo looks
 them up in the account the credentials belong to.
+
+### Redis
+
+```
+redis://user:pass@host:6379/0
+rediss://:pass@host:6380
+redis://localhost:6379/0?origin=source&reason=error
+```
+
+Limbo reads Redis streams, on Redis 6.2 or later or on Valkey. The queue is the stream's key and the path is the
+database number, `0` if you leave it out. `rediss://` connects over TLS. Leave out the user name to log in as the
+`default` user, as in `redis://:pass@host`, or leave out both for a server without a password. Limbo connects to a
+single server, not to a Redis Cluster or through Sentinel.
+
+Redis has no dead-lettering of its own, so your app decides what an entry in a dead-letter stream holds. These
+options tell limbo which fields to read:
+
+| Option | Field that holds | Default |
+|---|---|---|
+| `body` | the message body | `payload` |
+| `origin` | the stream the message failed in, where `replay` and `import` send it | none |
+| `reason` | why the message failed, for `--reason` and `stats` | none |
+
+Every other field is a header. Without `origin`, messages have no dead-letter history, and `replay` and `import` need
+`--to`. The URL also takes go-redis's connection options, such as `dial_timeout=5s` or `skip_verify=true`.
 
 ## Commands
 
@@ -196,6 +221,7 @@ also removes messages that arrive while it runs:
 
 - RabbitMQ purges only the messages no consumer holds.
 - SQS can take up to 60 seconds to finish and allows one purge per queue every 60 seconds.
+- Redis trims the stream to nothing and keeps the key and its consumer groups.
 
 ### Backups
 
@@ -244,9 +270,10 @@ dead-letter history fail unless you pass `--to`, and limbo then exits with code 
 - Limbo's error also lists the lines of messages it could not publish, such as those with no dead-letter history,
   and `--skip` doesn't send them again. Fix the cause and import those lines on their own, for example with
   `--skip <line - 1> -n 1`.
-- A file from the other broker imports on a best-effort basis. RabbitMQ takes SQS message attributes as string
-  headers and publishes the copies as transient messages, since SQS has no delivery mode. SQS turns RabbitMQ headers
-  into `String` and `Number` attributes, and refuses a message with more than 10.
+- A file from another broker imports on a best-effort basis. RabbitMQ takes SQS message attributes and Redis fields as
+  string headers and publishes the copies as transient messages, since neither has a delivery mode. SQS turns headers
+  into `String` and `Number` attributes, and refuses a message with more than 10. Redis writes the body to the field
+  the URL's `body` option names and each header as a field, with numbers and booleans as text and tables as JSON.
 - Filters see the headers as the file records them. `--header key=value` compares a timestamp header as an RFC 3339
   time and a bytes header as base64, not as `peek` prints them from a queue.
 
@@ -270,7 +297,7 @@ death, headers, body and age.
 | Filter | Matches messages |
 |---|---|
 | `--id <id>` | with this message ID |
-| `--reason <reason>` | whose last death had this reason: `rejected`, `expired`, `maxlen` or `delivery_limit` |
+| `--reason <reason>` | whose last death had this reason: `rejected`, `expired`, `maxlen` or `delivery_limit`, or on Redis the `reason` field's value |
 | `--from <queue>` | that last died in this queue |
 | `--header <key>` or `<key>=<value>` | with this header, or this value for it |
 | `--body <regex>` | whose body matches this [regular expression](https://pkg.go.dev/regexp/syntax) |
@@ -285,13 +312,14 @@ or expired, in any queue except `payments`.
 
 Age is the time of the last death, or the publish time when the broker records no death time, as on SQS. On SQS every
 dead-lettered message has the reason `delivery_limit`, message attributes are its headers, and FIFO messages also have
-a `MessageGroupId` header.
+a `MessageGroupId` header. On Redis the fields other than the body, `origin` and `reason` fields are the headers, and
+age is the time the entry was added to the stream.
 
-On SQS the ID is the message ID SQS assigned, which is unique. On RabbitMQ it is the `message_id` the publisher set,
-which can be missing or shared by several messages, so `--id` matches every message with that ID and none without one.
-Check what an ID matches with `peek --id` before you delete it.
+On SQS and Redis the ID is the ID the broker assigned, which is unique. On RabbitMQ it is the `message_id` the
+publisher set, which can be missing or shared by several messages, so `--id` matches every message with that ID and
+none without one. Check what an ID matches with `peek --id` before you delete it.
 
-Limbo matches filters itself, because neither broker can filter a queue. A filtered run reads messages until it has
+Limbo matches filters itself, because no supported broker can filter a queue. A filtered run reads messages until it has
 enough matches, which can mean every message up to the depth it counted.
 
 ## JSON output
@@ -351,6 +379,8 @@ line is the message as `peek -o json` prints it, with `"version":1` first:
   `timestamp` or `bytes`, such as `{"x-limbo-replay-count":"int64","x-limbo-replayed-at":"timestamp"}`.
 - SQS: `attribute_types`, the data type of each message attribute that isn't a `String`, such as
   `{"amount":"Number","signature":"Binary"}`.
+- Redis: `body_field`, the field that held the body, or `""` if the entry had none, and `field_types`, which marks
+  each field whose value isn't valid UTF-8 as `bytes`, such as `{"signature":"bytes"}`.
 
 Header values become JSON values, so a timestamp appears as an RFC 3339 string and bytes as base64. Strings, booleans,
 tables and arrays need no type. Values nested inside a table or an array have no recorded type. A later version of the
@@ -368,8 +398,8 @@ format would change `version`.
 
 ### What limbo guarantees
 
-- `peek` and `stats` never remove a message. Limbo holds every message it reads and returns them all when it is done,
-  including after Ctrl-C.
+- `peek` and `stats` never remove a message. On brokers where a read holds messages, limbo returns them all when it
+  is done, including after Ctrl-C.
 - `replay` removes a message from the dead-letter queue only after the broker confirms its copy reached the
   destination. Messages it cannot replay, skips or doesn't reach go back to the dead-letter queue.
 - `replay` never reads past the depth it counted before it started, so messages that fail again and return to the
@@ -386,8 +416,8 @@ format would change `version`.
   original, the message ends up in both queues. Consumers should tolerate duplicates.
 - **Importing a file twice sends its messages twice.** The file keeps every message, so a second import publishes them
   again. Only SQS FIFO queues drop a copy they saw in the last 5 minutes. Continue a stopped import with `--skip`.
-- **Reading a message is a delivery.** Brokers have no way to read a queue without handing out its messages, so the
-  messages look delivered afterwards. See the broker sections below.
+- **Reading a message is a delivery.** RabbitMQ and SQS have no way to read a queue without handing out its messages,
+  so the messages look delivered afterwards. See the broker sections below.
 - **Other consumers of the dead-letter queue don't see the messages limbo holds** until it returns them.
 - **A second Ctrl-C quits at once**, without returning the messages limbo holds. RabbitMQ returns them when the
   connection closes, and SQS shows them again when their 5-minute hold runs out.
@@ -430,6 +460,22 @@ format would change `version`.
   rerunning a replay within the 5-minute deduplication window doesn't send a copy twice.
 - `purge --no-backup` uses `PurgeQueue`, which returns before SQS has removed everything. SQS finishes within 60
   seconds, may also remove messages sent in that time, and allows one purge per queue every 60 seconds.
+
+#### Redis
+
+- A read changes nothing. Limbo reads entries with `XRANGE` and holds none, so other consumers keep seeing them.
+- Redis has no locks. Limbo removes an entry with `XDEL` once its copy or backup is safe, and stops if another client
+  removed it first, since that client may have copied it too. Don't run two replays or deletes on one stream at once.
+- A run reads up to the newest entry there was when it began, so copies that fail back into the same stream aren't
+  taken again.
+- A copy is confirmed when Redis replies to `XADD`. Whether it survives a crash depends on the server's AOF or RDB
+  persistence. Limbo doesn't wait for replicas.
+- Replayed copies are new entries with new IDs. They keep every field of the original except the `origin` and
+  `reason` fields, carry `x-limbo-replay-count` and `x-limbo-replayed-at`, and list the body field first and the other
+  fields sorted by name. A copy for a stream that doesn't exist fails instead of creating it, and the original stays.
+- `purge --no-backup` uses `XTRIM` with `MAXLEN 0`, which keeps the stream and its consumer groups.
+- An ACL user needs `+ping +type +xlen +xrange +xrevrange` on the dead-letter stream, plus `+xdel` for `replay`,
+  `delete` and `purge`, `+xtrim` for `purge --no-backup`, and `+type +xadd` on every stream `replay` or `import` sends to.
 
 ### SQS permissions
 
@@ -475,7 +521,8 @@ To add a broker, read [Adding a broker](docs/adding-a-broker.md). It covers the 
 broker maps onto them, and how to test against a real broker.
 
 `task test` runs the tests and `task lint` runs the lint checks from CI. The integration tests run when
-`LIMBO_TEST_AMQP_URL` or `LIMBO_TEST_SQS_URL` points at a broker. CI runs them against RabbitMQ and ElasticMQ.
+`LIMBO_TEST_AMQP_URL`, `LIMBO_TEST_SQS_URL` or `LIMBO_TEST_REDIS_URL` points at a broker. CI runs them against
+RabbitMQ, ElasticMQ and Redis.
 
 ## License
 

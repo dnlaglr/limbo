@@ -61,9 +61,16 @@ jobs:
         options: >-
           --health-cmd "nc -z localhost 9324"
           --health-interval 2s --health-timeout 5s --health-retries 15
+      redis:
+        image: redis:8.12
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 15
     env:
       LIMBO_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
       LIMBO_TEST_SQS_URL: sqs://us-east-1?endpoint=http://localhost:9324
+      LIMBO_TEST_REDIS_URL: redis://localhost:6379/0
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
     steps:
