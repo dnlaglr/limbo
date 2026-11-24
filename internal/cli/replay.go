@@ -37,6 +37,11 @@ tolerate duplicates.
 On RabbitMQ, replayed messages drop the broker's x-death, x-first-death-*, x-last-death-*, x-delivery-count and
 x-acquired-count headers and carry x-limbo-replay-count and x-limbo-replayed-at instead.
 
+On Redis, replayed copies are new stream entries with the original's fields, minus the origin and reason fields,
+plus x-limbo-replay-count and x-limbo-replayed-at, written body first and the rest sorted by name. A copy for a
+stream that doesn't exist fails instead of creating it. Redis has no locks, so limbo stops if another client deletes
+an entry it has just copied, since that client may have copied it too.
+
 On SQS, replayed copies keep the body, message attributes and message group, and carry x-limbo-replay-count and
 x-limbo-replayed-at unless that would pass the limit of 10 attributes. Copies sent to a FIFO queue use limbo- followed
 by the dead-letter copy's message ID as their deduplication ID.

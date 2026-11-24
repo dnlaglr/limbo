@@ -12,6 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.53.0
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/rabbitmq/amqp091-go v1.17.0
+	github.com/redis/go-redis/v9 v9.23.0
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -28,6 +29,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.44.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.53.0 // indirect
 	github.com/aws/smithy-go v1.28.9 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/harmonica v0.2.0 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20261008173134-6b8d4baf91b4 // indirect
@@ -48,7 +50,8 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/xo/terminfo v1.0.0 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
 )

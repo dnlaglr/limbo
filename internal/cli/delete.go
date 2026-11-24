@@ -72,7 +72,8 @@ func newPurgeCmd(a *app.App) *cobra.Command {
 
 With --no-backup, limbo uses the broker's own purge, which is instant but also removes messages that arrive while it
 runs. RabbitMQ purges only the messages no consumer holds. SQS can take up to 60 seconds to finish, allows one purge
-per queue a minute, and needs the sqs:PurgeQueue permission.
+per queue a minute, and needs the sqs:PurgeQueue permission. Redis trims the stream to nothing and keeps the key and
+its consumer groups.
 
 Limbo asks before it purges. Pass --yes to skip the question, which is required without a terminal, or --dry-run to
 list the messages that would go without removing anything.`,

@@ -18,12 +18,13 @@ import (
 const (
 	filterHelp = `Filters pick messages by their ID, last death, headers, body and age. Different filters must all match, a filter
 given more than once matches any of its values, and --not-* filters skip every message they match. Age is the time of
-the last death, or the publish time when the broker records no death time, as on SQS. On RabbitMQ the ID is the
-message_id its publisher set, which can be missing or shared by several messages.`
+the last death, or the publish time when the broker records no death time, as on SQS. On Redis it is the time the
+entry was added to the stream. On RabbitMQ the ID is the message_id its publisher set, which can be missing or shared
+by several messages. On SQS and Redis it is unique.`
 	readHelp = `Brokers may record each read as a delivery. RabbitMQ marks the messages as redelivered, and quorum queues before
 RabbitMQ 4.3 count each read toward their delivery limit. SQS adds each read to a message's receive count and hides
 the message from other consumers until limbo returns it, or for up to 5 minutes if limbo is killed. SQS FIFO queues
-hand out at most the first 10 messages of each message group while limbo holds them.`
+hand out at most the first 10 messages of each message group while limbo holds them. Redis records nothing.`
 )
 
 type filterOptions struct {
@@ -36,7 +37,7 @@ func addFilterFlags(cmd *cobra.Command, o *filterOptions) {
 	f, flags := &o.filter, cmd.Flags()
 	flags.Var(listOf(&f.IDs.Any, parseID, "id"), "id", "only messages with this ID")
 	flags.Var(listOf(&f.IDs.None, parseID, "id"), "not-id", "skip messages with this ID")
-	flags.StringArrayVar(&f.Reasons.Any, "reason", nil, "only messages whose last death had this reason, such as rejected, expired, maxlen or delivery_limit")
+	flags.StringArrayVar(&f.Reasons.Any, "reason", nil, "only messages whose last death had this reason, such as rejected, expired, maxlen or delivery_limit, or on Redis the reason field's value")
 	flags.StringArrayVar(&f.Reasons.None, "not-reason", nil, "skip messages whose last death had this reason")
 	flags.StringArrayVar(&f.Sources.Any, "from", nil, "only messages that last died in this queue")
 	flags.StringArrayVar(&f.Sources.None, "not-from", nil, "skip messages that last died in this queue")
