@@ -13,9 +13,13 @@ implementations.
 2. It looks up the URL scheme in `app.App.Brokers` and calls that broker's `broker.Opener`.
 3. It calls `Depth` to count the queue, then `Browse` to read it. Commands that remove messages go through
    `broker.Replay` or `broker.Remove`, which call your `Take` and `Publish`. `purge --no-backup` calls `Purge`.
+   `import` reads a file instead of a queue and goes through `broker.Import`, which calls your `Publish`. With `--to`,
+   it calls `Depth` on that queue first, so `Depth` must report a missing queue for a typo to fail before anything is
+   sent.
 
 limbo matches filters itself, because no supported broker can filter a queue server-side. A driver never inspects
-filters. `broker.Replay` and `broker.Remove` apply them to each message your `Take` hands out.
+filters. `broker.Replay` and `broker.Remove` apply them to each message your `Take` hands out, and `broker.Import` to
+each message in the file.
 
 ## What a driver implements
 
@@ -285,6 +289,8 @@ The commands have no broker-specific code, but their help text describes what ea
 - Add any new death reasons to the `--reason` flag help in `selection.go`, and say what a message ID is on the broker
   in `filterHelp` if it isn't unique.
 - Describe how replayed copies differ from the originals in the `replay` help in `replay.go`.
+- Describe how files from the other brokers import into yours, and yours into theirs, in the `import` help in
+  `import.go` and in the README's import section.
 - If you implement `Purge`, describe what it does in the `purge` help in `delete.go`.
 
 ### Step 10: Test the driver

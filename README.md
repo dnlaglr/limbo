@@ -32,7 +32,7 @@ Archives are named `limbo_<version>_<os>_<arch>`, for `darwin`, `linux` and `win
 `.tar.gz` or `.zip` on Windows. Each release has a `checksums.txt` to verify them against:
 
 ```bash
-VERSION=0.1.0
+VERSION=0.2.0
 curl -fsSLO "https://github.com/dnlaglr/limbo/releases/download/v${VERSION}/limbo_${VERSION}_linux_amd64.tar.gz"
 curl -fsSLO "https://github.com/dnlaglr/limbo/releases/download/v${VERSION}/checksums.txt"
 sha256sum --check --ignore-missing checksums.txt
@@ -221,7 +221,7 @@ limbo import backup.ndjson --reason rejected --rate 50 --skip 500
 ```
 
 Publishes the messages in an export or backup file to the queue each one died in, or to `--to`. Messages with no
-dead-letter history are reported and skipped unless you pass `--to`. Nothing is removed from the file.
+dead-letter history fail unless you pass `--to`, and limbo then exits with code 1. Nothing is removed from the file.
 
 | Flag | Effect |
 |---|---|
@@ -232,19 +232,23 @@ dead-letter history are reported and skipped unless you pass `--to`. Nothing is 
 | `--rate <n>` | Import at most this many messages per second (default unlimited) |
 | `--skip <n>` | Start after line `n` of the file, to continue an import that stopped |
 
-- Limbo reads the whole file before it publishes anything. If a line isn't a record it can read, it stops with the
-  line number and publishes nothing.
+- Limbo reads the whole file before it publishes anything, and publishes only the messages it read then. If a line
+  isn't a record it can read, it stops with the line number and publishes nothing.
 - Copies follow replay's rules: they drop the broker's dead-letter headers, carry `x-limbo-replay-count` and
   `x-limbo-replayed-at`, and on an SQS FIFO queue use `limbo-` followed by the message ID as their deduplication ID.
   They keep the body and the headers and properties the file records, with their types.
 - If an import stops early, limbo's error names the line it stopped after. Run the same command with `--skip` and that
   line number to continue without sending a message twice. After a send that timed out, the line given is the one
-  before it, so the message whose arrival is unknown is sent again rather than skipped.
+  before it, so the message whose arrival is unknown is sent again rather than skipped. `--limit` counts from where
+  the run starts, so continuing with `-n 100` imports up to 100 more messages.
 - Limbo's error also lists the lines of messages it could not publish, such as those with no dead-letter history,
   and `--skip` doesn't send them again. Fix the cause and import those lines on their own, for example with
   `--skip <line - 1> -n 1`.
 - A file from the other broker imports on a best-effort basis. RabbitMQ takes SQS message attributes as string
-  headers. SQS turns RabbitMQ headers into `String` and `Number` attributes, and refuses a message with more than 10.
+  headers and publishes the copies as transient messages, since SQS has no delivery mode. SQS turns RabbitMQ headers
+  into `String` and `Number` attributes, and refuses a message with more than 10.
+- Filters see the headers as the file records them. `--header key=value` compares a timestamp header as an RFC 3339
+  time and a bytes header as base64, not as `peek` prints them from a queue.
 
 ### Common flags
 
