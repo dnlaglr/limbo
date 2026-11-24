@@ -170,6 +170,15 @@ func TestPeekFiltered(t *testing.T) {
 	}
 }
 
+func TestPeekByID(t *testing.T) {
+	d := browsing(rejectedOrder, expiredPayment, orphan)
+
+	code, out, errOut := runWith(t, fakeBrokers(d), "peek", "orders.dlq", "--url", "fake://x", "--id", expiredPayment.ID)
+	if code != exitOK || !strings.Contains(out, "orders.dlq  1/1") || !strings.Contains(out, expiredPayment.ID) || strings.Contains(out, rejectedOrder.ID) {
+		t.Errorf("exit code %d, stdout:\n%s\nwant only %s; stderr:\n%s", code, out, expiredPayment.ID, errOut)
+	}
+}
+
 func TestPeekErrors(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -185,6 +194,8 @@ func TestPeekErrors(t *testing.T) {
 		{"bad regex", []string{"--url", "fake://x", "--body", "("}, nil, `invalid argument "(" for "--body" flag: error parsing regexp`},
 		{"bad age", []string{"--url", "fake://x", "--older-than", "3w"}, nil, "use a positive duration such as 30m, 2h or 7d"},
 		{"nameless header", []string{"--url", "fake://x", "--not-header", "=acme"}, nil, "name the header, as key or key=value"},
+		{"empty id", []string{"--url", "fake://x", "--id="}, nil, "an ID can't be empty"},
+		{"empty not-id", []string{"--url", "fake://x", "--not-id", ""}, nil, "an ID can't be empty"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
