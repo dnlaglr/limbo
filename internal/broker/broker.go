@@ -1,12 +1,14 @@
 package broker
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
 	"net/url"
 	"slices"
@@ -48,6 +50,53 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		Body         string `json:"body"`
 		BodyEncoding string `json:"body_encoding"`
 	}{message(m), body, encoding})
+}
+
+// Numbers decode as json.Number so 64-bit header values keep their exact value, and drivers restore the types they need
+func (m *Message) UnmarshalJSON(b []byte) error {
+	type message Message
+	var record struct {
+		message
+		Body         string `json:"body"`
+		BodyEncoding string `json:"body_encoding"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&record); err != nil {
+		return err
+	}
+
+	body := []byte(record.Body)
+	switch record.BodyEncoding {
+	case "utf-8":
+	case "base64":
+		var err error
+		if body, err = base64.StdEncoding.DecodeString(record.Body); err != nil {
+			return fmt.Errorf("body is not base64: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown body_encoding %q (use utf-8 or base64)", record.BodyEncoding)
+	}
+
+	*m = Message(record.message)
+	m.Body = body
+	return nil
+}
+
+// StringMap reads a properties value that maps names to strings, as a driver stores it or as JSON decodes it
+func StringMap(v any) map[string]string {
+	switch m := v.(type) {
+	case map[string]string:
+		return m
+	case map[string]any:
+		strs := make(map[string]string, len(m))
+		for k, s := range m {
+			strs[k], _ = s.(string)
+		}
+		return strs
+	}
+
+	return nil
 }
 
 // Deaths are ordered most recent first so the 0 index names the queue the message last died in
@@ -132,19 +181,43 @@ type Taken struct {
 	Err     error
 }
 
-// A send that timed out may have reached its destination anyway, so the replay stops instead of risking more
 func Replay(ctx context.Context, d Replayer, queue string, opts ReplayOptions, each func(Taken)) error {
-	r := &run{sel: opts.Selection, each: each, stop: func(err error) bool { return errors.Is(err, context.DeadlineExceeded) }}
-	r.keep = func(m Message) (string, error) {
+	r := &run{sel: opts.Selection, each: each, keep: publishing(ctx, d, opts), stop: unsure}
+	return d.Take(ctx, queue, opts.Scan, r.next)
+}
+
+// Import publishes messages read from somewhere other than a queue, such as an export file, so there is nothing to remove
+func Import(ctx context.Context, d Publisher, msgs iter.Seq2[Message, error], opts ReplayOptions, each func(Taken)) error {
+	r := &run{sel: opts.Selection, each: each, keep: publishing(ctx, d, opts), stop: unsure}
+	for m, err := range msgs {
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err != nil {
+			return err
+		}
+
+		more, err := r.next(m, func() error { return nil })
+		if err != nil || !more {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func publishing(ctx context.Context, d Publisher, opts ReplayOptions) func(Message) (string, error) {
+	return func(m Message) (string, error) {
 		to, err := opts.Target(m)
 		if err == nil {
 			err = d.Publish(ctx, to, m)
 		}
 		return to, err
 	}
-
-	return d.Take(ctx, queue, opts.Scan, r.next)
 }
+
+// A send that timed out may have reached its destination anyway, so the run stops instead of risking more
+func unsure(err error) bool { return errors.Is(err, context.DeadlineExceeded) }
 
 // A backup that fails ends the run, since every message after it would fail the same way
 func Remove(ctx context.Context, d Taker, queue string, opts RemoveOptions, each func(Taken)) error {
