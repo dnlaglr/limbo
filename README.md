@@ -14,13 +14,15 @@
 
 **Get failed messages out of limbo. Safely.**
 
-A single binary for inspecting, triaging, and replaying dead-letter queue messages, with the same workflow for
-RabbitMQ and Amazon SQS. More brokers are planned.
+A single binary for inspecting, triaging, replaying and cleaning up dead-letter queue messages, with the same workflow
+for RabbitMQ and Amazon SQS. More brokers are planned.
 
 - `limbo peek` shows what is in a dead-letter queue and leaves every message there.
 - `limbo stats` counts the messages and tells you when and why they died.
 - `limbo replay` moves messages back to the queue they failed in, removing each one only after the broker confirms
   its copy.
+- `limbo export` saves messages to a file and leaves every message in the queue.
+- `limbo delete` and `limbo purge` remove poison messages for good, saving each one to a backup file first.
 
 ## Install
 
@@ -55,10 +57,12 @@ limbo stats orders.dlq
 limbo peek orders.dlq -n 5
 limbo replay orders.dlq --reason rejected --dry-run
 limbo replay orders.dlq --reason rejected
+limbo delete orders.dlq --reason expired --older-than 7d
 ```
 
 `stats` and `peek` print what they found and put every message back. The dry run shows where each message would go.
-The last command asks before it moves anything.
+The replay asks before it moves anything. The delete asks too, then saves each message it removes to a backup file in
+the current folder.
 
 ## Broker URLs
 
@@ -136,11 +140,80 @@ once the broker confirms its copy. Messages with no dead-letter history stay whe
 Limbo asks before it replays. With filters, it reads the queue once to count the matches before it asks, and then
 replays no more than the messages it counted.
 
+### export
+
+```bash
+limbo export orders.dlq
+limbo export orders.dlq --reason rejected --newer-than 1h --file rejected.ndjson
+limbo export orders.dlq --file - | gzip > orders.dlq.ndjson.gz
+```
+
+Writes the matching messages to a file and returns every message it read, like `peek`. The file holds one message per
+line, in the [export format](#export-files).
+
+| Flag | Effect |
+|---|---|
+| `-f`, `--file <path>` | Write to this file, or `-` for stdout (default `<queue>-<time>.ndjson` in the current folder) |
+| `-n`, `--limit <n>` | Export at most this many matching messages (default all) |
+
+### delete
+
+```bash
+limbo delete orders.dlq --id 4f1c2a7e
+limbo delete orders.dlq --reason expired --older-than 7d --dry-run
+limbo delete orders.dlq --body '"poison":true' --backup poison.ndjson --yes
+```
+
+Removes the messages that match the filters for good, after saving each one to a [backup](#backups). Delete refuses to
+run without a filter, `--id` or `--limit`. Use `purge` to remove every message. Messages it doesn't delete go back, in
+their original order where the broker keeps one.
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Show which messages would go without deleting anything |
+| `-y`, `--yes` | Delete without asking first. Required without a terminal |
+| `-n`, `--limit <n>` | Delete at most this many matching messages (default all) |
+| `--backup <path>` | Save the backup to this file (default `<queue>-<time>.ndjson` in the current folder) |
+| `--no-backup` | Delete without saving a backup |
+
+Limbo asks before it deletes. With filters, it reads the queue once to count the matches before it asks, and then
+deletes no more than the messages it counted.
+
+### purge
+
+```bash
+limbo purge orders.dlq
+limbo purge orders.dlq --backup orders-dlq-before-deploy.ndjson --yes
+limbo purge orders.dlq --no-backup --yes
+```
+
+Removes every message in the queue, as counted when it starts, after saving each one to a [backup](#backups). It takes
+`--dry-run`, `--yes`, `--backup` and `--no-backup` like `delete`, but no filters.
+
+With `--no-backup`, limbo uses the broker's own purge instead of removing messages one by one. It is instant, but it
+also removes messages that arrive while it runs:
+
+- RabbitMQ purges only the messages no consumer holds.
+- SQS can take up to 60 seconds to finish and allows one purge per queue every 60 seconds.
+
+### Backups
+
+`delete` and `purge` save every message they remove to a backup file first, unless you pass `--no-backup`:
+
+- The default file is `<queue>-<time>.ndjson` in the current folder, such as `orders.dlq-20261122T101500Z.ndjson`.
+  Characters other than letters, digits, `.`, `_` and `-` in the queue name become `_`.
+- Limbo writes each message and flushes it to disk before it removes it. After a crash or Ctrl-C, the backup holds
+  every message limbo removed.
+- The file uses the [export format](#export-files). It is created readable and writable by you only (mode `0600`) and
+  never replaces an existing file. On Windows it inherits the folder's permissions.
+- Limbo creates the file before it asks, so a path it can't write fails before anything is read. If nothing is
+  removed, the file is deleted again.
+
 ### Common flags
 
 | Flag | Effect |
 |---|---|
-| `-o`, `--output text\|json` | Output format for `peek`, `stats` and `replay` |
+| `-o`, `--output text\|json` | Output format for `peek`, `stats`, `replay`, `delete` and `purge` |
 | `-q`, `--quiet` | Print only results and errors, without status lines or warnings |
 | `--no-color` | Disable colored output, same as `NO_COLOR=1` |
 | `--debug` | Print debug logs to stderr |
@@ -150,10 +223,12 @@ records no commit or date for it.
 
 ## Filters
 
-`peek`, `stats` and `replay` take the same filters. They pick messages by their last death, headers, body and age.
+`peek`, `stats`, `replay`, `export` and `delete` take the same filters. They pick messages by their ID, last death,
+headers, body and age.
 
 | Filter | Matches messages |
 |---|---|
+| `--id <id>` | with this message ID |
 | `--reason <reason>` | whose last death had this reason: `rejected`, `expired`, `maxlen` or `delivery_limit` |
 | `--from <queue>` | that last died in this queue |
 | `--header <key>` or `<key>=<value>` | with this header, or this value for it |
@@ -161,7 +236,7 @@ records no commit or date for it.
 | `--older-than <age>` | that died longer ago than this, such as `30m`, `2h` or `7d` |
 | `--newer-than <age>` | that died within this long |
 
-`--reason`, `--from`, `--header` and `--body` each have a `--not-` form that skips the messages it matches.
+`--id`, `--reason`, `--from`, `--header` and `--body` each have a `--not-` form that skips the messages it matches.
 
 Different filters must all match. A filter given more than once matches any of its values, and `--not-` filters skip
 every message they match. So `--reason rejected --reason expired --not-from payments` picks messages that were rejected
@@ -170,6 +245,10 @@ or expired, in any queue except `payments`.
 Age is the time of the last death, or the publish time when the broker records no death time, as on SQS. On SQS every
 dead-lettered message has the reason `delivery_limit`, message attributes are its headers, and FIFO messages also have
 a `MessageGroupId` header.
+
+On SQS the ID is the message ID SQS assigned, which is unique. On RabbitMQ it is the `message_id` the publisher set,
+which can be missing or shared by several messages, so `--id` matches every message with that ID and none without one.
+Check what an ID matches with `peek --id` before you delete it.
 
 Limbo matches filters itself, because neither broker can filter a queue. A filtered run reads messages until it has
 enough matches, which can mean every message up to the depth it counted.
@@ -198,12 +277,42 @@ otherwise:
 {"id":"orphan","status":"returned","error":"no dead-letter history, pass --to to choose a destination"}
 ```
 
+`delete` and `purge` print the same records without `to`, with the status `deleted` or `purged`, `would_delete` or
+`would_purge`, or `returned` for a message that went back because its backup failed. `purge --no-backup` removes
+messages without reading them, so it prints one object with the depth it counted instead:
+
+```json
+{"queue":"orders.dlq","status":"purged","depth":6}
+```
+
+## Export files
+
+`export` and the backups of `delete` and `purge` write one message per line. Each line is the message as `peek -o json`
+prints it, with `"version":1` first:
+
+```json
+{"version":1,"id":"o1","queue":"orders.dlq","content_type":"application/json","headers":{"tenant":"acme"},"properties":{"app_id":"shop","delivery_mode":2},"deaths":[{"queue":"orders","reason":"rejected","count":1,"time":"2026-11-22T21:57:05Z","routing_keys":["orders"]}],"body":"{\"orderId\":1042}","body_encoding":"utf-8"}
+```
+
+`properties` holds what limbo needs to publish an identical copy, and is left out when it would be empty:
+
+- RabbitMQ: the message properties that are set, among `content_encoding`, `delivery_mode`, `priority`,
+  `correlation_id`, `reply_to`, `expiration`, `type`, `user_id` and `app_id`, and `header_types`, the AMQP type of
+  each header that JSON can't express: `int8` to `int64`, `uint8` to `uint32`, `float32`, `float64`, `decimal`,
+  `timestamp` or `bytes`, such as `{"x-limbo-replay-count":"int64","x-limbo-replayed-at":"timestamp"}`.
+- SQS: `attribute_types`, the data type of each message attribute that isn't a `String`, such as
+  `{"amount":"Number","signature":"Binary"}`.
+
+Header values become JSON values, so a timestamp appears as an RFC 3339 string and bytes as base64. Strings, booleans,
+tables and arrays need no type. Values nested inside a table or an array have no recorded type. A later version of the
+format would change `version`.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success, including an empty queue or a replay you declined |
-| `1` | An error: invalid flags or URL, a connection or broker error, a replay that left messages it could not replay, or a replay without `--yes` and without a terminal |
+| `0` | Success, including an empty queue or a run you declined |
+| `1` | An error: invalid flags or URL, a connection or broker error, a file limbo can't write, a replay or delete that left messages it could not move or back up, or a replay, delete or purge without `--yes` and without a terminal |
 | `130` | Interrupted by Ctrl-C or SIGTERM. Limbo returns the messages it holds before it exits |
 
 ## Safety
@@ -216,7 +325,10 @@ otherwise:
   destination. Messages it cannot replay, skips or doesn't reach go back to the dead-letter queue.
 - `replay` never reads past the depth it counted before it started, so messages that fail again and return to the
   dead-letter queue are not replayed twice in one run.
-- Limbo never prints the credentials in the broker URL.
+- `export` never removes a message.
+- `delete` and `purge` remove a message only after its line in the backup is written and flushed to disk, unless you
+  pass `--no-backup`. Messages they skip, can't back up or don't reach go back to the dead-letter queue.
+- Limbo never prints the credentials in the broker URL, and never overwrites a file.
 
 ### Caveats
 
@@ -227,6 +339,11 @@ otherwise:
 - **Other consumers of the dead-letter queue don't see the messages limbo holds** until it returns them.
 - **A second Ctrl-C quits at once**, without returning the messages limbo holds. RabbitMQ returns them when the
   connection closes, and SQS shows them again when their 5-minute hold runs out.
+- **Backups are slower.** Limbo flushes the backup to disk once per message, which costs about as much as the broker
+  round trip it already makes, and more on macOS, where a flush reaches the physical disk. Use `purge --no-backup` to
+  empty a large queue you don't need a copy of.
+- **Export and backup files hold message bodies in plain text.** Keep them somewhere only the people who may read the
+  messages can reach.
 
 #### RabbitMQ
 
@@ -239,6 +356,7 @@ otherwise:
   delivery.
 - Replayed messages drop the broker's `x-death`, `x-first-death-*`, `x-last-death-*`, `x-delivery-count` and
   `x-acquired-count` headers and carry `x-limbo-replay-count` and `x-limbo-replayed-at` instead.
+- `purge --no-backup` uses `queue.purge`, which removes only the messages no consumer holds.
 
 #### Amazon SQS
 
@@ -258,11 +376,13 @@ otherwise:
   `x-limbo-replay-count` and `x-limbo-replayed-at` unless that would pass the limit of 10 attributes.
 - Copies sent to a FIFO queue use `limbo-` followed by the dead-letter copy's message ID as their deduplication ID, so
   rerunning a replay within the 5-minute deduplication window doesn't send a copy twice.
+- `purge --no-backup` uses `PurgeQueue`, which returns before SQS has removed everything. SQS finishes within 60
+  seconds, may also remove messages sent in that time, and allows one purge per queue every 60 seconds.
 
 ### SQS permissions
 
-`peek` and `stats` need the first statement. `replay` also needs the other two, with a statement like the last one for
-every queue it sends to:
+`peek`, `stats` and `export` need the first statement. `replay`, `delete` and `purge` also need the second, and
+`replay` needs a statement like the last one for every queue it sends to:
 
 ```json
 {
@@ -275,7 +395,7 @@ every queue it sends to:
       "Resource": "arn:aws:sqs:eu-west-1:123456789012:orders-dlq"
     },
     {
-      "Sid": "LimboRemoveReplayed",
+      "Sid": "LimboRemove",
       "Effect": "Allow",
       "Action": "sqs:DeleteMessage",
       "Resource": "arn:aws:sqs:eu-west-1:123456789012:orders-dlq"
@@ -290,7 +410,9 @@ every queue it sends to:
 }
 ```
 
-A destination needs `sqs:GetQueueAttributes` only with `--to`, which limbo checks before it starts. For queues
+A destination needs `sqs:GetQueueAttributes` only with `--to`, which limbo checks before it starts. `purge --no-backup`
+needs `sqs:PurgeQueue` on the dead-letter queue, and only `sqs:GetQueueUrl` and `sqs:GetQueueAttributes` from the
+first statement, since it reads no messages. For queues
 encrypted with a customer managed KMS key, limbo also needs `kms:Decrypt` on the key to read, and `kms:GenerateDataKey`
 and `kms:Decrypt` to send.
 
