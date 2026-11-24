@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"maps"
 	"net/url"
 	"slices"
 	"strconv"
@@ -30,12 +29,16 @@ const (
 
 	deathReason     = "delivery_limit"
 	groupHeader     = "MessageGroupId"
+	attributeTypes  = "attribute_types"
 	replayCountAttr = "x-limbo-replay-count"
 	replayedAtAttr  = "x-limbo-replayed-at"
 )
 
+// Copies holds the IDs of messages sent during the current Take, so it never hands back a copy that failed again and returned during the run
 type driver struct {
 	client *awssqs.Client
+	urls   map[string]string
+	copies map[string]bool
 }
 
 func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
@@ -59,11 +62,13 @@ func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
 		return nil, fmt.Errorf("loading AWS credentials: %w", err)
 	}
 
-	return &driver{client: awssqs.NewFromConfig(cfg, func(o *awssqs.Options) {
+	client := awssqs.NewFromConfig(cfg, func(o *awssqs.Options) {
 		if endpoint != "" {
 			o.BaseEndpoint = &endpoint
 		}
-	})}, nil
+	})
+
+	return &driver{client: client, urls: map[string]string{}, copies: map[string]bool{}}, nil
 }
 
 func parseURL(u *url.URL) (endpoint string, err error) {
@@ -97,8 +102,8 @@ func parseURL(u *url.URL) (endpoint string, err error) {
 func (d *driver) Close() error { return nil }
 
 func (d *driver) Browse(ctx context.Context, queue string, n int, visit func(broker.Message) bool) error {
-	return d.scan(ctx, queue, n, nil, func(m types.Message, _ func() error) (bool, error) {
-		return visit(toMessage(queue, m)), nil
+	return d.Take(ctx, queue, n, func(m broker.Message, _ func() error) (bool, error) {
+		return visit(m), nil
 	})
 }
 
@@ -119,66 +124,85 @@ func (d *driver) Depth(ctx context.Context, queue string) (int, error) {
 	return strconv.Atoi(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)])
 }
 
-func (d *driver) Replay(ctx context.Context, queue string, opts broker.ReplayOptions, each func(broker.Replayed)) error {
-	run, urls, copies := opts.Start(each), map[string]string{}, map[string]bool{}
-	return d.scan(ctx, queue, opts.Scan, copies, func(m types.Message, remove func() error) (bool, error) {
-		_, more, err := run.Next(toMessage(queue, m), func(to string) error {
-			id, err := d.send(ctx, urls, to, m)
-			copies[id] = true
-			return err
-		}, remove)
-		return more, err
-	})
-}
-
-func (d *driver) send(ctx context.Context, urls map[string]string, to string, m types.Message) (string, error) {
+func (d *driver) Publish(ctx context.Context, queue string, m broker.Message) error {
 	ctx, cancel := settle(ctx)
 	defer cancel()
 
-	addr, ok := urls[to]
-	if !ok {
-		var err error
-		if addr, err = d.queueURL(ctx, to); err != nil {
-			return "", err
-		}
-		urls[to] = addr
-	}
-
-	out, err := d.client.SendMessage(ctx, sendInput(addr, to, m, time.Now()))
+	addr, err := d.queueURL(ctx, queue)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	return aws.ToString(out.MessageId), nil
+	out, err := d.client.SendMessage(ctx, sendInput(addr, queue, m, time.Now()))
+	if err != nil {
+		return err
+	}
+	d.copies[aws.ToString(out.MessageId)] = true
+
+	return nil
 }
 
-func sendInput(addr, to string, m types.Message, now time.Time) *awssqs.SendMessageInput {
-	attrs := maps.Clone(m.MessageAttributes)
-	if attrs == nil {
-		attrs = map[string]types.MessageAttributeValue{}
-	}
-	count := atoi(aws.ToString(attrs[replayCountAttr].StringValue)) + 1
-	delete(attrs, replayCountAttr)
-	delete(attrs, replayedAtAttr)
-	if len(attrs)+2 <= maxAttributes {
-		attrs[replayCountAttr] = types.MessageAttributeValue{DataType: aws.String("Number"), StringValue: aws.String(strconv.Itoa(count))}
-		attrs[replayedAtAttr] = types.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(now.UTC().Format(time.RFC3339))}
+func (d *driver) Purge(ctx context.Context, queue string) error {
+	ctx, cancel := settle(ctx)
+	defer cancel()
+
+	addr, err := d.queueURL(ctx, queue)
+	if err != nil {
+		return err
 	}
 
-	in := &awssqs.SendMessageInput{QueueUrl: &addr, MessageBody: m.Body, MessageAttributes: attrs}
-	if group := m.Attributes[groupHeader]; group != "" {
+	_, err = d.client.PurgeQueue(ctx, &awssqs.PurgeQueueInput{QueueUrl: &addr})
+	if _, ok := errors.AsType[*types.PurgeQueueInProgress](err); ok {
+		return errors.New("only one purge per SQS queue is allowed every 60 seconds, try again in a minute")
+	}
+
+	return err
+}
+
+func sendInput(addr, to string, m broker.Message, now time.Time) *awssqs.SendMessageInput {
+	dataTypes, _ := m.Properties[attributeTypes].(map[string]string)
+	attrs := map[string]types.MessageAttributeValue{}
+	for k, v := range m.Headers {
+		if k != groupHeader && k != replayCountAttr && k != replayedAtAttr {
+			attrs[k] = attribute(cmp.Or(dataTypes[k], "String"), v)
+		}
+	}
+
+	previous, _ := m.Headers[replayCountAttr].(string)
+	if len(attrs)+2 <= maxAttributes {
+		attrs[replayCountAttr] = attribute("Number", strconv.Itoa(atoi(previous)+1))
+		attrs[replayedAtAttr] = attribute("String", now.UTC().Format(time.RFC3339))
+	}
+
+	in := &awssqs.SendMessageInput{QueueUrl: &addr, MessageBody: aws.String(string(m.Body)), MessageAttributes: attrs}
+	if group, _ := m.Headers[groupHeader].(string); group != "" {
 		in.MessageGroupId = &group
 	}
 
 	// Stable for this dead-letter copy so a rerun can't send it twice
 	if strings.HasSuffix(to, ".fifo") {
-		in.MessageDeduplicationId = aws.String("limbo-" + aws.ToString(m.MessageId))
+		in.MessageDeduplicationId = aws.String("limbo-" + m.ID)
 	}
 
 	return in
 }
 
+func attribute(dataType string, v any) types.MessageAttributeValue {
+	a := types.MessageAttributeValue{DataType: &dataType}
+	if b, ok := v.([]byte); ok {
+		a.BinaryValue = b
+	} else {
+		a.StringValue = aws.String(fmt.Sprint(v))
+	}
+
+	return a
+}
+
 func (d *driver) queueURL(ctx context.Context, name string) (string, error) {
+	if addr, ok := d.urls[name]; ok {
+		return addr, nil
+	}
+
 	out, err := d.client.GetQueueUrl(ctx, &awssqs.GetQueueUrlInput{QueueName: &name})
 	if _, ok := errors.AsType[*types.QueueDoesNotExist](err); ok {
 		return "", fmt.Errorf("queue %q not found", name)
@@ -187,17 +211,19 @@ func (d *driver) queueURL(ctx context.Context, name string) (string, error) {
 		return "", err
 	}
 
-	return aws.ToString(out.QueueUrl), nil
+	d.urls[name] = aws.ToString(out.QueueUrl)
+	return d.urls[name], nil
 }
 
 // Every message received stays hidden until release returns it, so SQS can't hand it out twice, and one it hands out again anyway is visited only once
 // A receive that brings nothing new ends the scan, as on an empty queue or a FIFO queue whose groups are all held
-func (d *driver) scan(ctx context.Context, queue string, n int, copies map[string]bool, visit func(m types.Message, remove func() error) (bool, error)) (err error) {
+func (d *driver) Take(ctx context.Context, queue string, n int, visit func(broker.Message, func() error) (bool, error)) (err error) {
 	addr, err := d.queueURL(ctx, queue)
 	if err != nil {
 		return err
 	}
 
+	clear(d.copies)
 	held := map[string]string{}
 	defer func() { err = errors.Join(err, d.release(ctx, addr, held)) }()
 
@@ -226,8 +252,7 @@ func (d *driver) scan(ctx context.Context, queue string, n int, copies map[strin
 			}
 
 			held[id], fresh = handle, true
-			// A copy this run replayed that failed again and came back is held but never replayed twice
-			if copies[id] {
+			if d.copies[id] {
 				continue
 			}
 			if visiting && ctx.Err() != nil {
@@ -238,7 +263,7 @@ func (d *driver) scan(ctx context.Context, queue string, n int, copies map[strin
 			}
 
 			visited++
-			more, err := visit(m, func() error {
+			more, err := visit(toMessage(queue, m), func() error {
 				if err := d.remove(ctx, addr, held[id]); err != nil {
 					return err
 				}
@@ -353,6 +378,7 @@ func toMessage(queue string, m types.Message) broker.Message {
 		Timestamp:     epochMillis(m.Attributes["SentTimestamp"]),
 		DeliveryCount: max(atoi(m.Attributes["ApproximateReceiveCount"])-1, 0),
 		Headers:       headers(m),
+		Properties:    properties(m),
 	}
 	if arn := m.Attributes["DeadLetterQueueSourceArn"]; arn != "" {
 		msg.Deaths = []broker.Death{{Queue: arn[strings.LastIndexByte(arn, ':')+1:], Reason: deathReason, Count: 1}}
@@ -378,6 +404,21 @@ func headers(m types.Message) map[string]any {
 	}
 
 	return h
+}
+
+// Headers carry every attribute's value as a string or bytes, so a copy needs each one's data type to match the original
+func properties(m types.Message) map[string]any {
+	dataTypes := map[string]string{}
+	for k, v := range m.MessageAttributes {
+		if t := aws.ToString(v.DataType); t != "String" {
+			dataTypes[k] = t
+		}
+	}
+	if len(dataTypes) == 0 {
+		return nil
+	}
+
+	return map[string]any{attributeTypes: dataTypes}
 }
 
 func epochMillis(s string) time.Time {

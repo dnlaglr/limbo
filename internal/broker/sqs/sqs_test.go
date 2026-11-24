@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -82,6 +83,7 @@ func TestToMessage(t *testing.T) {
 				Timestamp:     time.UnixMilli(1795010531000).UTC(),
 				DeliveryCount: 3,
 				Headers:       map[string]any{"tenant": "acme", "attempt": "3", "sig": []byte{1, 2}, "MessageGroupId": "acme"},
+				Properties:    map[string]any{"attribute_types": map[string]string{"attempt": "Number", "sig": "Binary"}},
 				Deaths:        []broker.Death{{Queue: "orders.fifo", Reason: "delivery_limit", Count: 1}},
 			},
 		},
@@ -159,38 +161,57 @@ func TestSendInput(t *testing.T) {
 		}
 		return attrs
 	}
+	userHeaders := func(n int) map[string]any {
+		h := map[string]any{}
+		for i := range n {
+			h["a"+strconv.Itoa(i)] = "v"
+		}
+		return h
+	}
 	marked := func(attrs map[string]types.MessageAttributeValue, count string) map[string]types.MessageAttributeValue {
 		attrs = maps.Clone(attrs)
 		attrs[replayCountAttr] = attr("Number", count)
 		attrs[replayedAtAttr] = attr("String", "2026-11-20T09:30:00Z")
 		return attrs
 	}
-	message := func(attrs map[string]types.MessageAttributeValue) types.Message {
-		return types.Message{MessageId: aws.String("id-1"), Body: aws.String("b"), MessageAttributes: attrs}
+	message := func(headers map[string]any, attributeTypes map[string]string) broker.Message {
+		m := broker.Message{ID: "id-1", Body: []byte("b"), Headers: headers}
+		if attributeTypes != nil {
+			m.Properties = map[string]any{"attribute_types": attributeTypes}
+		}
+		return m
 	}
 	input := func(attrs map[string]types.MessageAttributeValue) *awssqs.SendMessageInput {
 		return &awssqs.SendMessageInput{QueueUrl: aws.String("url"), MessageBody: aws.String("b"), MessageAttributes: attrs}
 	}
 
-	replayedFIFO := message(map[string]types.MessageAttributeValue{
-		"tenant":        attr("String", "acme"),
-		replayCountAttr: attr("Number", "2"),
-		replayedAtAttr:  attr("String", "2026-01-01T00:00:00Z"),
-	})
-	replayedFIFO.Attributes = map[string]string{"MessageGroupId": "acme"}
+	replayedFIFO := message(map[string]any{
+		"tenant":         "acme",
+		replayCountAttr:  "2",
+		replayedAtAttr:   "2026-01-01T00:00:00Z",
+		"MessageGroupId": "acme",
+	}, map[string]string{replayCountAttr: "Number"})
 	wantFIFO := input(marked(map[string]types.MessageAttributeValue{"tenant": attr("String", "acme")}, "3"))
 	wantFIFO.MessageGroupId, wantFIFO.MessageDeduplicationId = aws.String("acme"), aws.String("limbo-id-1")
+
+	typed := message(map[string]any{"attempt": "3", "price": "9.50", "sig": []byte{1, 2}}, map[string]string{"attempt": "Number", "price": "Number.float", "sig": "Binary"})
+	wantTyped := input(marked(map[string]types.MessageAttributeValue{
+		"attempt": attr("Number", "3"),
+		"price":   attr("Number.float", "9.50"),
+		"sig":     {DataType: aws.String("Binary"), BinaryValue: []byte{1, 2}},
+	}, "1"))
 
 	tests := []struct {
 		name string
 		to   string
-		in   types.Message
+		in   broker.Message
 		want *awssqs.SendMessageInput
 	}{
 		{"fifo", "orders.fifo", replayedFIFO, wantFIFO},
-		{"standard", "orders", message(nil), input(marked(userAttrs(0), "1"))},
-		{"eight attributes", "orders", message(userAttrs(8)), input(marked(userAttrs(8), "1"))},
-		{"nine attributes", "orders", message(userAttrs(9)), input(userAttrs(9))},
+		{"standard", "orders", message(nil, nil), input(marked(userAttrs(0), "1"))},
+		{"typed attributes", "orders", typed, wantTyped},
+		{"eight attributes", "orders", message(userHeaders(8), nil), input(marked(userAttrs(8), "1"))},
+		{"nine attributes", "orders", message(userHeaders(9), nil), input(userAttrs(9))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -216,7 +237,7 @@ func TestReplay(t *testing.T) {
 			waitForDepth(t, d, dlq, 5)
 
 			canceled, cancel := context.WithCancel(context.Background())
-			err := replayer(d).Replay(canceled, dlq, firstN(5), func(r broker.Replayed) {
+			err := broker.Replay(canceled, d, dlq, firstN(5), func(r broker.Taken) {
 				if r.Err == nil {
 					cancel()
 				}
@@ -269,7 +290,7 @@ func TestReplayHoldsCopiesThatFailAgain(t *testing.T) {
 			}
 
 			var got []string
-			err = replayer(d).Replay(ctx, dlq, firstN(2), func(r broker.Replayed) {
+			err = broker.Replay(ctx, d, dlq, firstN(2), func(r broker.Taken) {
 				got = append(got, string(r.Message.Body)+" → "+r.To)
 				for range 2 {
 					if _, err := d.client.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{QueueUrl: &sourceURL}); err != nil {
@@ -312,18 +333,62 @@ func TestReleaseSkipsLostHolds(t *testing.T) {
 	}
 }
 
-func firstN(n int) broker.ReplayOptions {
-	return broker.ReplayOptions{Selection: broker.Selection{Scan: n}}
+func TestRemove(t *testing.T) {
+	for _, kind := range []string{"standard", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			fifo := kind == "fifo"
+			d := connect(t)
+			_, dlq := deadLetter(t, d, fifo, 4)
+
+			var backedUp []string
+			opts := broker.RemoveOptions{
+				Selection: broker.Selection{Filter: broker.Filter{Bodies: broker.Rule[*regexp.Regexp]{Any: []*regexp.Regexp{regexp.MustCompile(`^m[12]$`)}}}, Scan: 4},
+				Backup:    func(m broker.Message) error { backedUp = append(backedUp, string(m.Body)); return nil },
+			}
+			removed := 0
+			err := broker.Remove(context.Background(), d, dlq, opts, func(r broker.Taken) {
+				if r.Err == nil {
+					removed++
+				}
+			})
+			if err != nil || removed != 2 || !slices.Equal(inOrder(fifo, backedUp), []string{"m1", "m2"}) {
+				t.Fatalf("Remove() removed %d, backed up %q, err %v; want m1 and m2", removed, backedUp, err)
+			}
+
+			waitForDepth(t, d, dlq, 2)
+			if got := inOrder(fifo, browseBodies(t, d, dlq, 2)); !slices.Equal(got, []string{"m0", "m3"}) {
+				t.Fatalf("%s holds %q after a filtered remove, want m0 and m3", dlq, got)
+			}
+		})
+	}
 }
 
-func replayer(d *driver) broker.Replayer {
-	return broker.Driver(d).(broker.Replayer)
+func TestPurge(t *testing.T) {
+	for _, kind := range []string{"standard", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			d := connect(t)
+			_, dlq := deadLetter(t, d, kind == "fifo", 3)
+
+			if err := d.Purge(context.Background(), dlq); err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, d, dlq, 0)
+
+			if err := d.Purge(context.Background(), missingQueue); err == nil || err.Error() != `queue "`+missingQueue+`" not found` {
+				t.Errorf("purge of a missing queue: err = %v", err)
+			}
+		})
+	}
+}
+
+func firstN(n int) broker.ReplayOptions {
+	return broker.ReplayOptions{Selection: broker.Selection{Scan: n}}
 }
 
 func replay(t *testing.T, d *driver, fifo bool, queue string, opts broker.ReplayOptions, want ...string) {
 	t.Helper()
 	var got []string
-	err := replayer(d).Replay(context.Background(), queue, opts, func(r broker.Replayed) {
+	err := broker.Replay(context.Background(), d, queue, opts, func(r broker.Taken) {
 		s := string(r.Message.Body) + " → " + r.To
 		if r.Err != nil {
 			s += " ✗ " + r.Err.Error()

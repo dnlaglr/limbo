@@ -107,9 +107,10 @@ func runPeek(ctx context.Context, a *app.App, queue string, opts peekOptions) er
 	sel := broker.Selection{Filter: opts.filter.build(time.Now()), Limit: opts.limit, Scan: depth}
 	var msgs []broker.Message
 	most := 0
-	scanned, err := browse(ctx, a, d, queue, sel, func(m broker.Message) {
+	scanned, err := browse(ctx, a, d, queue, sel, func(m broker.Message) error {
 		msgs = append(msgs, m)
 		most = max(most, m.DeliveryCount)
+		return nil
 	})
 
 	if len(msgs) > 0 {

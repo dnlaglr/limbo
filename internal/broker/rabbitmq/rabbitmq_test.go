@@ -20,11 +20,21 @@ func TestToMessage(t *testing.T) {
 	expiredAt := rejectedAt.Add(-time.Minute)
 
 	got := toMessage("orders.dlq", &amqp.Delivery{
-		MessageId:   "4f1c2a7e",
-		ContentType: "application/json",
-		Body:        []byte(`{"orderId":1042}`),
+		MessageId:     "4f1c2a7e",
+		ContentType:   "application/json",
+		DeliveryMode:  amqp.Persistent,
+		CorrelationId: "c-9",
+		AppId:         "shop",
+		Body:          []byte(`{"orderId":1042}`),
 		Headers: amqp.Table{
 			"tenant":              "acme",
+			"vip":                 true,
+			"attempt":             int32(3),
+			"ratio":               float64(0.5),
+			"price":               amqp.Decimal{Scale: 2, Value: 1999},
+			"sent-at":             expiredAt,
+			"sig":                 []byte{1, 2},
+			"trace":               amqp.Table{"hop": int8(1)},
 			"x-delivery-count":    int64(4),
 			"x-first-death-queue": "orders.retry",
 			"x-last-death-reason": "rejected",
@@ -41,7 +51,22 @@ func TestToMessage(t *testing.T) {
 		Body:          []byte(`{"orderId":1042}`),
 		ContentType:   "application/json",
 		DeliveryCount: 4,
-		Headers:       map[string]any{"tenant": "acme"},
+		Headers: map[string]any{
+			"tenant":  "acme",
+			"vip":     true,
+			"attempt": int32(3),
+			"ratio":   float64(0.5),
+			"price":   amqp.Decimal{Scale: 2, Value: 1999},
+			"sent-at": expiredAt,
+			"sig":     []byte{1, 2},
+			"trace":   amqp.Table{"hop": int8(1)},
+		},
+		Properties: map[string]any{
+			"delivery_mode":  uint8(2),
+			"correlation_id": "c-9",
+			"app_id":         "shop",
+			"header_types":   map[string]string{"attempt": "int32", "ratio": "float64", "price": "decimal", "sent-at": "timestamp", "sig": "bytes"},
+		},
 		Deaths: []broker.Death{
 			{Queue: "orders", Reason: "rejected", Count: 3, Time: rejectedAt, Exchange: "shop", RoutingKeys: []string{"order.created"}},
 			{Queue: "orders.retry", Reason: "expired", Count: 1, Time: expiredAt, RoutingKeys: []string{"orders"}},
@@ -54,22 +79,28 @@ func TestToMessage(t *testing.T) {
 
 func TestToMessageWithoutHeaders(t *testing.T) {
 	got := toMessage("q", &amqp.Delivery{Body: []byte("x")})
-	if got.Headers != nil || len(got.Deaths) != 0 || got.DeliveryCount != 0 {
-		t.Errorf("toMessage() = %+v, want no headers, deaths or deliveries", got)
+	if got.Headers != nil || got.Properties != nil || len(got.Deaths) != 0 || got.DeliveryCount != 0 {
+		t.Errorf("toMessage() = %+v, want no headers, properties, deaths or deliveries", got)
 	}
 }
 
 func TestRepublishing(t *testing.T) {
 	now := time.Date(2026, 11, 19, 9, 30, 0, 0, time.UTC)
 
-	got := republishing(&amqp.Delivery{
-		MessageId:     "4f1c2a7e",
-		ContentType:   "application/json",
-		DeliveryMode:  amqp.Persistent,
-		Priority:      5,
-		CorrelationId: "c-1",
-		Timestamp:     now.Add(-time.Hour),
-		Body:          []byte(`{"orderId":1042}`),
+	got := republishing(toMessage("orders.dlq", &amqp.Delivery{
+		MessageId:       "4f1c2a7e",
+		ContentType:     "application/json",
+		ContentEncoding: "gzip",
+		DeliveryMode:    amqp.Persistent,
+		Priority:        5,
+		CorrelationId:   "c-1",
+		ReplyTo:         "replies",
+		Expiration:      "60000",
+		Type:            "order.created",
+		UserId:          "guest",
+		AppId:           "shop",
+		Timestamp:       now.Add(-time.Hour),
+		Body:            []byte(`{"orderId":1042}`),
 		Headers: amqp.Table{
 			"tenant":              "acme",
 			"x-delivery-count":    int64(4),
@@ -79,17 +110,23 @@ func TestRepublishing(t *testing.T) {
 			"x-death":             []any{amqp.Table{"queue": "orders", "reason": "rejected", "count": int64(3)}},
 			replayCountHeader:     int64(2),
 		},
-	}, now)
+	}), now)
 
 	want := amqp.Publishing{
-		MessageId:     "4f1c2a7e",
-		ContentType:   "application/json",
-		DeliveryMode:  amqp.Persistent,
-		Priority:      5,
-		CorrelationId: "c-1",
-		Timestamp:     now.Add(-time.Hour),
-		Body:          []byte(`{"orderId":1042}`),
-		Headers:       amqp.Table{"tenant": "acme", replayCountHeader: int64(3), replayedAtHeader: now},
+		MessageId:       "4f1c2a7e",
+		ContentType:     "application/json",
+		ContentEncoding: "gzip",
+		DeliveryMode:    amqp.Persistent,
+		Priority:        5,
+		CorrelationId:   "c-1",
+		ReplyTo:         "replies",
+		Expiration:      "60000",
+		Type:            "order.created",
+		UserId:          "guest",
+		AppId:           "shop",
+		Timestamp:       now.Add(-time.Hour),
+		Body:            []byte(`{"orderId":1042}`),
+		Headers:         amqp.Table{"tenant": "acme", replayCountHeader: int64(3), replayedAtHeader: now},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("republishing() =\n%+v\nwant\n%+v", got, want)
@@ -159,7 +196,7 @@ func TestReplay(t *testing.T) {
 			}
 
 			canceled, cancel := context.WithCancel(ctx)
-			err := d.(broker.Replayer).Replay(canceled, dlq, firstN(4), func(broker.Replayed) { cancel() })
+			err := broker.Replay(canceled, d.(broker.Replayer), dlq, firstN(4), func(broker.Taken) { cancel() })
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled Replay() err = %v, want context.Canceled", err)
 			}
@@ -176,6 +213,14 @@ func TestReplay(t *testing.T) {
 			for i, m := range replayed {
 				if m.ID != "m"+strconv.Itoa(i) || len(m.Deaths) != 0 || len(m.Headers) != 2 || m.Headers[replayCountHeader] != int64(1) {
 					t.Errorf("replayed message %d = %+v, want m%d with only limbo's headers and replayed once", i, m, i)
+				}
+				want := map[string]any{
+					"delivery_mode": uint8(2),
+					"app_id":        "limbo-test",
+					"header_types":  map[string]string{replayCountHeader: "int64", replayedAtHeader: "timestamp"},
+				}
+				if !reflect.DeepEqual(m.Properties, want) {
+					t.Errorf("replayed message %d has properties %v, want %v", i, m.Properties, want)
 				}
 			}
 		})
@@ -241,6 +286,70 @@ func TestFilteredReplay(t *testing.T) {
 	}
 }
 
+func TestRemove(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			d, ch := connect(t)
+			dlq := deadLetter(t, ch, testQueue(queueType), queueType, 5)
+
+			var backedUp, got []string
+			opts := broker.RemoveOptions{
+				Selection: broker.Selection{Filter: broker.Filter{IDs: broker.Rule[string]{Any: []string{"m1", "m3"}}}, Scan: 5},
+				Backup:    func(m broker.Message) error { backedUp = append(backedUp, m.ID); return nil },
+			}
+			err := broker.Remove(context.Background(), d.(broker.Taker), dlq, opts, func(r broker.Taken) { got = append(got, outcome(r)) })
+			skipped := " →  ✗ " + broker.ErrSkipped.Error()
+			if want := []string{"m0" + skipped, "m1 → ", "m2" + skipped, "m3 → ", "m4" + skipped}; err != nil || !slices.Equal(got, want) {
+				t.Fatalf("Remove() = %q, %v; want %q", got, err, want)
+			}
+			if !slices.Equal(backedUp, []string{"m1", "m3"}) {
+				t.Errorf("backed up %q, want m1 and m3", backedUp)
+			}
+
+			waitForDepth(t, ch, dlq, 3)
+			if ids := browseIDs(t, d, dlq, 3); !slices.Equal(ids, []string{"m0", "m2", "m4"}) {
+				t.Fatalf("%s holds %q after a filtered remove, want the rest in order", dlq, ids)
+			}
+		})
+	}
+}
+
+func TestPublishAfterClosedChannel(t *testing.T) {
+	ctx := context.Background()
+	d, ch := connect(t)
+	queue := testQueue("classic")
+	declare(t, ch, queue, "classic", amqp.Table{})
+
+	p := d.(broker.Publisher)
+	if err := p.Publish(ctx, queue, broker.Message{ID: "bad", Properties: map[string]any{"expiration": "soon"}}); err == nil {
+		t.Fatal("Publish() of an invalid expiration = nil, want the broker's error")
+	}
+	if err := p.Publish(ctx, queue, broker.Message{ID: "good"}); err != nil {
+		t.Fatalf("Publish() after the broker closed the channel = %v, want nil", err)
+	}
+	waitForDepth(t, ch, queue, 1)
+}
+
+func TestPurge(t *testing.T) {
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			d, ch := connect(t)
+			source := testQueue(queueType)
+			dlq := deadLetter(t, ch, source, queueType, 3)
+
+			if err := d.(broker.Purger).Purge(context.Background(), dlq); err != nil {
+				t.Fatal(err)
+			}
+			waitForDepth(t, ch, dlq, 0)
+
+			missing := source + ".missing"
+			if err := d.(broker.Purger).Purge(context.Background(), missing); err == nil || err.Error() != `queue "`+missing+`" not found` {
+				t.Errorf("purge of a missing queue: err = %v", err)
+			}
+		})
+	}
+}
+
 func firstN(n int) broker.ReplayOptions {
 	return broker.ReplayOptions{Selection: broker.Selection{Scan: n}}
 }
@@ -248,7 +357,7 @@ func firstN(n int) broker.ReplayOptions {
 func replay(t *testing.T, d broker.Driver, queue string, opts broker.ReplayOptions, wantErr error, want ...string) {
 	t.Helper()
 	var got []string
-	err := d.(broker.Replayer).Replay(context.Background(), queue, opts, func(r broker.Replayed) {
+	err := broker.Replay(context.Background(), d.(broker.Replayer), queue, opts, func(r broker.Taken) {
 		got = append(got, outcome(r))
 	})
 	if !errors.Is(err, wantErr) || !slices.Equal(got, want) {
@@ -256,7 +365,7 @@ func replay(t *testing.T, d broker.Driver, queue string, opts broker.ReplayOptio
 	}
 }
 
-func outcome(r broker.Replayed) string {
+func outcome(r broker.Taken) string {
 	s := r.Message.ID + " → " + r.To
 	if r.Err != nil {
 		s += " ✗ " + r.Err.Error()
@@ -320,7 +429,7 @@ func deadLetter(t *testing.T, ch *amqp.Channel, source, queueType string, n int)
 
 	msgs := make([]amqp.Publishing, n)
 	for i := range msgs {
-		msgs[i] = amqp.Publishing{MessageId: "m" + strconv.Itoa(i), Body: []byte(`{"n":` + strconv.Itoa(i) + `}`)}
+		msgs[i] = amqp.Publishing{MessageId: "m" + strconv.Itoa(i), DeliveryMode: amqp.Persistent, AppId: "limbo-test", Body: []byte(`{"n":` + strconv.Itoa(i) + `}`)}
 	}
 	reject(t, ch, source, msgs...)
 	waitForDepth(t, ch, dlq, n)

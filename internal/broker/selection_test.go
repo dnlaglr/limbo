@@ -9,6 +9,7 @@ import (
 func TestFilterMatch(t *testing.T) {
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	rejected := Message{
+		ID:      "4f1c",
 		Body:    []byte(`{"orderId":1042}`),
 		Headers: map[string]any{"tenant": "acme", "attempt": int64(3)},
 		Deaths: []Death{
@@ -26,6 +27,7 @@ func TestFilterMatch(t *testing.T) {
 		want   [3]bool
 	}{
 		{"no filter", Filter{}, [3]bool{true, true, true}},
+		{"id", Filter{IDs: strs([]string{"4f1c"}, nil)}, [3]bool{true, false, false}},
 		{"reason", Filter{Reasons: strs([]string{"expired", "rejected"}, nil)}, [3]bool{true, false, false}},
 		{"only the last death counts", Filter{Reasons: strs([]string{"expired"}, nil)}, [3]bool{false, false, false}},
 		{"not reason", Filter{Reasons: strs(nil, []string{"rejected"})}, [3]bool{false, true, true}},

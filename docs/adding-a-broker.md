@@ -1,8 +1,8 @@
 # Adding a broker
 
 limbo reaches every broker through the interfaces in `internal/broker`. To add a broker, you write a driver package
-that implements them and register a URL scheme for it. The `peek`, `stats` and `replay` commands, filters included,
-then work with the new broker without changes.
+that implements them and register a URL scheme for it. The `peek`, `stats`, `export`, `replay`, `delete` and `purge`
+commands, filters included, then work with the new broker without changes.
 
 The RabbitMQ driver (`internal/broker/rabbitmq`) and the SQS driver (`internal/broker/sqs`) are the reference
 implementations.
@@ -11,26 +11,31 @@ implementations.
 
 1. The command parses `--url` or `LIMBO_URL` with `broker.ParseURL`.
 2. It looks up the URL scheme in `app.App.Brokers` and calls that broker's `broker.Opener`.
-3. It calls `Depth` to count the queue, then `Browse`, or `Replay` for `limbo replay`.
+3. It calls `Depth` to count the queue, then `Browse` to read it. Commands that remove messages go through
+   `broker.Replay` or `broker.Remove`, which call your `Take` and `Publish`. `purge --no-backup` calls `Purge`.
 
 limbo matches filters itself, because no supported broker can filter a queue server-side. A driver never inspects
-filters. It passes them to `broker.ReplayRun`, which applies them during a replay.
+filters. `broker.Replay` and `broker.Remove` apply them to each message your `Take` hands out.
 
 ## What a driver implements
 
-| Interface | Methods | Required |
-|---|---|---|
-| `broker.Driver` | `Browse`, `Depth`, `Close` | Yes |
-| `broker.Replayer` | `Replay` | No. Without it, `limbo replay` reports that the scheme is unsupported. |
+| Interface | Methods | Required | Unlocks |
+|---|---|---|---|
+| `broker.Driver` | `Browse`, `Depth`, `Close` | Yes | `peek`, `stats`, `export` |
+| `broker.Taker` | `Take` | No | `delete`, `purge` |
+| `broker.Publisher` | `Publish` | No | `replay`, together with `Taker` |
+| `broker.Purger` | `Purge` | No | `purge --no-backup` as one fast call, instead of removing messages one by one |
 
-limbo finds `Replayer` by type assertion, so a driver that can't move messages safely leaves it out. Every write
-capability is an optional interface found this way, so each broker implements only what it supports.
+`broker.Replayer` is `Taker` and `Publisher` together. limbo finds each capability by type assertion, so a driver
+that can't remove or publish messages safely leaves that interface out, and the commands that need it report that the
+scheme is unsupported. A driver implements primitives only. The rules every broker shares, such as removing a message
+only after its copy or backup is safe, live once in `internal/broker`.
 
 ## Choose the model for your dead-letter queue
 
-How you implement `Browse` and `Replay` depends on how the broker lets you read a message without removing it.
+How you implement `Browse` and `Take` depends on how the broker lets you read a message without removing it.
 
-| Model | Example | Read without removing | Return what was read | Remove after replay |
+| Model | Example | Read without removing | Return what was read | Remove (`Take`) |
 |---|---|---|---|---|
 | Lock and requeue | RabbitMQ | Get each message unacknowledged | One requeue for all held messages | Acknowledge |
 | Visibility lease | SQS | Receive with a visibility timeout | Set the visibility timeout to 0 | Delete by receipt handle |
@@ -45,7 +50,7 @@ How you implement `Browse` and `Replay` depends on how the broker lets you read 
 
 ### Visibility lease
 
-- Hold each message for a fixed time, and release every held message before `scan` returns, including after Ctrl-C.
+- Hold each message for a fixed time, and release every held message before `Take` returns, including after Ctrl-C.
 - The broker can hand out a message twice. Track the IDs you have visited and skip repeats.
 - End the scan when a receive brings nothing new. This ends it on an empty queue, and on FIFO message groups that the
   broker locks while you hold their messages.
@@ -55,13 +60,14 @@ How you implement `Browse` and `Replay` depends on how the broker lets you read 
 
 - `Browse` is a range read, so it has nothing to return.
 - `Depth` is usually exact, for example `XLEN` on a Redis stream.
-- Delete a replayed message by its ID, and only after the send succeeds.
+- `Take`'s remove deletes the message by its ID.
 
 ### Log
 
 - `Browse` reads each partition from its start offset without committing, so it has nothing to return.
-- A log has no per-message delete. Leave out `Replayer` until you decide what removal means for the broker. Committing
-  a consumer-group offset, for example, removes only a prefix of each partition.
+- A log has no per-message delete. Leave out `Taker`, and with it `replay`, `delete` and `purge`, until you decide
+  what removal means for the broker. Committing a consumer-group offset, for example, removes only a prefix of each
+  partition. `Publisher` doesn't depend on removal, so a log can still implement it.
 
 ## Add the driver
 
@@ -122,7 +128,13 @@ Convert broker messages in one function, `toMessage`:
 | `Timestamp` | When the message was first published |
 | `DeliveryCount` | Deliveries before this read |
 | `Headers` | User headers, without the broker's dead-letter bookkeeping |
+| `Properties` | Anything else `Publish` needs to send an identical copy, such as RabbitMQ's delivery mode or SQS attribute data types, or nil |
 | `Deaths` | Dead-letter history, most recent first |
+
+`Properties` keys are snake_case and broker-specific. Export and backup files store them as JSON, and only your driver
+reads them back, so record what an identical copy needs and nothing more. If a header or attribute value has a type
+that JSON can't express, record its type too, as the RabbitMQ driver's `header_types` and the SQS driver's
+`attribute_types` do.
 
 Filters and replay read `Deaths[0]` through `Origin()`, `Reason()` and `DiedAt()`:
 
@@ -163,60 +175,88 @@ For a missing queue, return `fmt.Errorf("queue %q not found", queue)` so that ev
 - Stop when `visit` returns false, when `ctx` is done, or when the broker hands out no more messages.
 - Return every held message before it returns, on every path, including cancellation.
 
-Write the read loop once, as a `scan` method that `Browse` and `Replay` share. Its callback receives a function that
-removes the current message:
+Write the read loop once, as the `Take` method, and build `Browse` on it. `Take` hands `visit` each message with a
+function that removes it, and returns every message `visit` doesn't remove, exactly as `Browse` does:
 
 ```go
 func (d *driver) Browse(ctx context.Context, queue string, n int, visit func(broker.Message) bool) error {
-	return d.scan(ctx, queue, n, func(r *Record, _ func() error) (bool, error) {
-		return visit(toMessage(queue, r)), nil
+	return d.Take(ctx, queue, n, func(m broker.Message, _ func() error) (bool, error) {
+		return visit(m), nil
 	})
 }
 ```
 
-### Step 6: Implement Replay
+### Step 6: Implement Take and Publish
 
-Skip this step if the broker has no safe way to remove a single message.
+Skip this step if the broker has no safe way to remove a single message. Without `Take`, the driver still supports
+`peek`, `stats` and `export`.
 
-`broker.ReplayRun` owns the rules that every broker shares. It skips messages the filters reject, resolves the
-destination, removes a message only after its copy is sent, and stops at the limit. Your driver supplies `send` and
-`remove`:
+`broker.Replay` and `broker.Remove` own the rules that every broker shares. They skip messages the filters reject,
+resolve the destination, remove a message only after its copy is sent or its backup is on disk, and stop at the
+limit. Your driver supplies the read loop with its remove, and a confirmed publish:
 
 ```go
-func (d *driver) Replay(ctx context.Context, queue string, opts broker.ReplayOptions, each func(broker.Replayed)) error {
-	run := opts.Start(each)
-	return d.scan(ctx, queue, opts.Scan, func(r *Record, remove func() error) (bool, error) {
-		_, more, err := run.Next(toMessage(queue, r), func(to string) error { return d.send(ctx, to, r) }, remove)
-		return more, err
-	})
+func (d *driver) Take(ctx context.Context, queue string, n int, visit func(broker.Message, func() error) (bool, error)) error {
+	held := d.client.Hold(queue)
+	defer held.ReturnAll()
+
+	for range n {
+		r, ok, err := held.Next(ctx)
+		if err != nil || !ok {
+			return err
+		}
+
+		more, err := visit(toMessage(queue, r), func() error { return d.remove(ctx, r) })
+		if err != nil || !more {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (d *driver) send(ctx context.Context, to string, r *Record) error {
+func (d *driver) Publish(ctx context.Context, queue string, m broker.Message) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
-	return d.client.PublishConfirmed(ctx, to, replayCopy(r, time.Now()))
+	return d.client.PublishConfirmed(ctx, queue, replayCopy(m, time.Now()))
 }
 ```
 
-When you implement `send`, `remove` and the copy:
+When you implement `Take`, its remove, `Publish` and the copy:
 
-- Return nil from `send` only after the broker confirms it has the copy.
-- Drop the broker's dead-letter metadata. Set `x-limbo-replay-count` to the previous value plus one, and set
-  `x-limbo-replayed-at` to the current time.
-- Run `send` and `remove` under `context.WithoutCancel(ctx)` with a timeout, as `send` does above, so Ctrl-C can't
-  leave a message half replayed.
-- If the destination deduplicates, as SQS FIFO queues do, derive the deduplication ID from the dead-letter copy. Never
-  reuse the original's.
+- Read no more than `n` messages. Replay and delete pass the depth counted before the run, so messages that fail again
+  and return to the dead-letter queue aren't taken twice. If a copy you published can return within that count, as on
+  SQS, remember the IDs of the copies published during the current `Take` and skip them.
+- Return nil from `Publish` only after the broker confirms it has the copy. Return an error that wraps
+  `context.DeadlineExceeded` when you gave up waiting for that confirm, because the copy may have arrived anyway.
+  `broker.Replay` then ends the run instead of risking more of the same.
+- Build the copy from the `broker.Message` alone, using `Headers` and `Properties`, so it doesn't depend on where the
+  message came from. Drop the broker's dead-letter metadata. Set `x-limbo-replay-count` to the previous value plus
+  one, and set `x-limbo-replayed-at` to the current time.
+- Run the remove and `Publish` under `context.WithoutCancel(ctx)` with a timeout, as `Publish` does above, so Ctrl-C
+  can't leave a message half removed or half replayed.
+- If the destination deduplicates, as SQS FIFO queues do, derive the deduplication ID from the dead-letter copy's ID.
+  Never reuse the original's.
 
-Read no more than `opts.Scan` messages. It holds the depth counted before the run, so messages that fail again and
-return to the dead-letter queue aren't replayed twice. If a returning copy can appear within that count, as on SQS,
-remember the IDs of the copies you sent and skip them.
+Return an error from `Take` only when the run can't continue, such as a lost connection, or when `visit` returns one.
+Per-message outcomes are reported by `broker.Replay` and `broker.Remove`, not by your driver.
 
-Return an error from `Replay` only when the run can't continue, such as a lost connection or a failed `remove`.
-Report each message's outcome through `each`, with any per-message error in `Replayed.Err`.
+### Step 7: Implement Purge (optional)
 
-### Step 7: Register the scheme
+If the broker can empty a queue in one call, implement `broker.Purger` so `purge --no-backup` doesn't have to remove
+messages one by one:
+
+```go
+func (d *driver) Purge(ctx context.Context, queue string) error {
+	return d.client.Purge(ctx, queue)
+}
+```
+
+Return `queue "<name>" not found` for a missing queue, as `Depth` does. The CLI help and README describe what the
+native purge does on each broker, such as which messages it skips and how long it takes.
+
+### Step 8: Register the scheme
 
 Add the opener to the registry in `internal/app/app.go`:
 
@@ -229,7 +269,7 @@ Brokers: broker.Registry{
 },
 ```
 
-### Step 8: Update the help text
+### Step 9: Update the help text
 
 The commands have no broker-specific code, but their help text describes what each broker does to messages. In
 `internal/cli`:
@@ -237,10 +277,12 @@ The commands have no broker-specific code, but their help text describes what ea
 - Add an example URL to `urlUsage` in `peek.go`.
 - Describe what a read does on the broker, such as redelivery counts or hidden messages, in `readHelp` in
   `selection.go`.
-- Add any new death reasons to the `--reason` flag help in `selection.go`.
+- Add any new death reasons to the `--reason` flag help in `selection.go`, and say what a message ID is on the broker
+  in `filterHelp` if it isn't unique.
 - Describe how replayed copies differ from the originals in the `replay` help in `replay.go`.
+- If you implement `Purge`, describe what it does in the `purge` help in `delete.go`.
 
-### Step 9: Test the driver
+### Step 10: Test the driver
 
 Write table tests for the pure functions, `toMessage` and the function that builds the copy.
 
@@ -274,9 +316,14 @@ Against a real broker or an emulator, test that:
 - A browse that stops early leaves every message in the queue, in order where the broker keeps one.
 - The origin queue and reason are mapped.
 - A missing queue returns `queue "<name>" not found`.
-- A replay to the origin queue moves the messages and the copies carry the limbo headers.
+- A replay to the origin queue moves the messages, and the copies carry the limbo headers and the original properties.
 - A replay to a missing queue, a canceled replay and a filtered replay leave the remaining messages in the queue.
 - A message without dead-letter history fails with `broker.ErrNoOrigin` unless `To` is set.
+- A filtered `broker.Remove` backs up and removes only the matching messages, and leaves the rest in order.
+- `Purge`, if implemented, empties the queue and reports a missing queue.
+
+Run these through `broker.Replay` and `broker.Remove`, as the CLI does, so they cover your driver together with the
+shared rules.
 
 Start the broker or an emulator, then run:
 
@@ -291,9 +338,11 @@ integration test skips, so a missing variable can't pass unnoticed.
 ## Checklist
 
 - [ ] `Open` rejects invalid URLs and never prints secrets.
-- [ ] `toMessage` sets `Deaths` with the queue the message failed in first.
-- [ ] `Browse` returns every held message on every path.
-- [ ] `Replay`, if implemented, removes a message only after the broker confirms its copy.
+- [ ] `toMessage` sets `Deaths` with the queue the message failed in first, and `Properties` with what a copy needs.
+- [ ] `Browse` and `Take` return every held message on every path.
+- [ ] `Publish`, if implemented, returns nil only after the broker confirms the copy, and builds it from the message
+  alone.
+- [ ] `Purge`, if implemented, is described in the `purge` help and the README.
 - [ ] The scheme is registered in `internal/app/app.go`.
 - [ ] The help text describes what the broker does to messages.
 - [ ] The broker runs as a service in the CI `integration` job, with its environment variable set.

@@ -34,6 +34,11 @@ func runWith(t *testing.T, brokers broker.Registry, args ...string) (code int, s
 	return code, out.String(), errOut.String()
 }
 
+// Fang wraps error text to fit the terminal, at a space or inside a word longer than a line, such as a temp path, so messages compare with all whitespace removed
+func squash(s string) string {
+	return strings.Join(strings.Fields(s), "")
+}
+
 func TestVersion(t *testing.T) {
 	code, out, _ := run(t, "version")
 	if code != exitOK {

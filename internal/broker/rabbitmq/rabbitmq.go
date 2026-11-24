@@ -25,6 +25,7 @@ const (
 
 type driver struct {
 	conn *amqp.Connection
+	out  *publisher
 }
 
 func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
@@ -39,8 +40,8 @@ func Open(ctx context.Context, u *url.URL) (broker.Driver, error) {
 func (d *driver) Close() error { return d.conn.Close() }
 
 func (d *driver) Browse(ctx context.Context, queue string, n int, visit func(broker.Message) bool) error {
-	return d.scan(ctx, queue, n, func(delivery *amqp.Delivery, _ func() error) (bool, error) {
-		return visit(toMessage(queue, delivery)), nil
+	return d.Take(ctx, queue, n, func(m broker.Message, _ func() error) (bool, error) {
+		return visit(m), nil
 	})
 }
 
@@ -59,31 +60,34 @@ func (d *driver) Depth(_ context.Context, queue string) (int, error) {
 	return q.Messages, nil
 }
 
-func (d *driver) Replay(ctx context.Context, queue string, opts broker.ReplayOptions, each func(broker.Replayed)) error {
-	out, err := d.publisher()
+// The broker closes a channel on some publish errors, such as an oversized message, so a closed one is reopened for the next message
+func (d *driver) Publish(_ context.Context, queue string, m broker.Message) error {
+	if d.out == nil || d.out.ch.IsClosed() {
+		out, err := d.publisher()
+		if err != nil {
+			return err
+		}
+		d.out = out
+	}
+
+	return d.out.publish(queue, republishing(m, time.Now()))
+}
+
+func (d *driver) Purge(_ context.Context, queue string) error {
+	ch, err := d.conn.Channel()
 	if err != nil {
 		return err
 	}
-	defer out.ch.Close()
+	defer ch.Close()
 
-	run := opts.Start(each)
-	return d.scan(ctx, queue, opts.Scan, func(delivery *amqp.Delivery, ack func() error) (bool, error) {
-		r, more, err := run.Next(toMessage(queue, delivery), func(to string) error { return out.publish(to, delivery) }, ack)
-		switch {
-		case err != nil || errors.Is(r.Err, broker.ErrSkipped):
-			return more, err
-		case out.ch.IsClosed() || errors.Is(r.Err, context.DeadlineExceeded):
-			return false, r.Err
-		}
-
-		return more, nil
-	})
+	_, err = ch.QueuePurge(queue, false)
+	return queueError(queue, err)
 }
 
-// Deliveries visit doesn't ack stay unacked until one multiple nack returns them all in order
+// Deliveries visit doesn't remove stay unacked until one multiple nack returns them all in order
 // Closing the channel instead would count as a failed delivery against a quorum queue's delivery limit
 // TODO: One basic.get round trip per message, a prefetching consumer is the upgrade if big scans get too slow
-func (d *driver) scan(ctx context.Context, queue string, n int, visit func(*amqp.Delivery, func() error) (bool, error)) (err error) {
+func (d *driver) Take(ctx context.Context, queue string, n int, visit func(broker.Message, func() error) (bool, error)) (err error) {
 	ch, err := d.conn.Channel()
 	if err != nil {
 		return err
@@ -122,7 +126,7 @@ func (d *driver) scan(ctx context.Context, queue string, n int, visit func(*amqp
 		}
 
 		acked := false
-		more, err := visit(&delivery, func() error {
+		more, err := visit(toMessage(queue, &delivery), func() error {
 			acked = true
 			return ch.Ack(delivery.DeliveryTag, false)
 		})
@@ -169,11 +173,11 @@ func (d *driver) publisher() (*publisher, error) {
 
 // Confirm wait ignores cancellation because giving up on it would leave the message's fate unknown
 // RabbitMQ sends a return before the confirm of the same message, so it's already buffered once the confirm arrives
-func (p *publisher) publish(queue string, d *amqp.Delivery) error {
+func (p *publisher) publish(queue string, msg amqp.Publishing) error {
 	ctx, cancel := context.WithTimeout(context.Background(), confirmTimeout)
 	defer cancel()
 
-	confirm, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, "", queue, true, false, republishing(d, time.Now()))
+	confirm, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, "", queue, true, false, msg)
 	if err != nil {
 		return err
 	}
@@ -201,31 +205,78 @@ func (p *publisher) publish(queue string, d *amqp.Delivery) error {
 	}
 }
 
-func republishing(d *amqp.Delivery, now time.Time) amqp.Publishing {
-	headers := withoutDeathHeaders(d.Headers)
+func republishing(m broker.Message, now time.Time) amqp.Publishing {
+	headers := withoutDeathHeaders(m.Headers)
 	if headers == nil {
 		headers = amqp.Table{}
 	}
 	delete(headers, "x-acquired-count")
-	headers[replayCountHeader] = int64(toInt(d.Headers[replayCountHeader]) + 1)
+	headers[replayCountHeader] = int64(toInt(m.Headers[replayCountHeader]) + 1)
 	headers[replayedAtHeader] = now
+
+	str := func(k string) string { s, _ := m.Properties[k].(string); return s }
+	num := func(k string) uint8 { n, _ := m.Properties[k].(uint8); return n }
 
 	return amqp.Publishing{
 		Headers:         headers,
-		ContentType:     d.ContentType,
-		ContentEncoding: d.ContentEncoding,
-		DeliveryMode:    d.DeliveryMode,
-		Priority:        d.Priority,
-		CorrelationId:   d.CorrelationId,
-		ReplyTo:         d.ReplyTo,
-		Expiration:      d.Expiration,
-		MessageId:       d.MessageId,
-		Timestamp:       d.Timestamp,
-		Type:            d.Type,
-		UserId:          d.UserId,
-		AppId:           d.AppId,
-		Body:            d.Body,
+		ContentType:     m.ContentType,
+		ContentEncoding: str("content_encoding"),
+		DeliveryMode:    num("delivery_mode"),
+		Priority:        num("priority"),
+		CorrelationId:   str("correlation_id"),
+		ReplyTo:         str("reply_to"),
+		Expiration:      str("expiration"),
+		MessageId:       m.ID,
+		Timestamp:       m.Timestamp,
+		Type:            str("type"),
+		UserId:          str("user_id"),
+		AppId:           str("app_id"),
+		Body:            m.Body,
 	}
+}
+
+// Properties hold what limbo doesn't model but needs to publish an identical copy, from a file as well as from the queue
+func properties(d *amqp.Delivery, headers amqp.Table) map[string]any {
+	p := map[string]any{
+		"content_encoding": d.ContentEncoding,
+		"delivery_mode":    d.DeliveryMode,
+		"priority":         d.Priority,
+		"correlation_id":   d.CorrelationId,
+		"reply_to":         d.ReplyTo,
+		"expiration":       d.Expiration,
+		"type":             d.Type,
+		"user_id":          d.UserId,
+		"app_id":           d.AppId,
+	}
+	maps.DeleteFunc(p, func(_ string, v any) bool { return v == "" || v == uint8(0) })
+	if types := headerTypes(headers); len(types) > 0 {
+		p["header_types"] = types
+	}
+	if len(p) == 0 {
+		return nil
+	}
+
+	return p
+}
+
+// JSON keeps strings, booleans, tables and arrays but not number widths, decimals, timestamps or bytes, so those get their AMQP type recorded
+// TODO: Top-level headers only, values nested in tables and arrays stay best-effort until a broker needs them exact
+func headerTypes(headers amqp.Table) map[string]string {
+	types := map[string]string{}
+	for k, v := range headers {
+		switch v.(type) {
+		case int8, uint8, int16, uint16, int32, uint32, int64, float32, float64:
+			types[k] = fmt.Sprintf("%T", v)
+		case amqp.Decimal:
+			types[k] = "decimal"
+		case time.Time:
+			types[k] = "timestamp"
+		case []byte:
+			types[k] = "bytes"
+		}
+	}
+
+	return types
 }
 
 // Peek shows these as fields and replayed copies would mislead
@@ -265,6 +316,7 @@ func queueError(queue string, err error) error {
 }
 
 func toMessage(queue string, d *amqp.Delivery) broker.Message {
+	headers := withoutDeathHeaders(d.Headers)
 	return broker.Message{
 		ID:            d.MessageId,
 		Queue:         queue,
@@ -272,7 +324,8 @@ func toMessage(queue string, d *amqp.Delivery) broker.Message {
 		ContentType:   d.ContentType,
 		Timestamp:     d.Timestamp,
 		DeliveryCount: toInt(d.Headers["x-delivery-count"]),
-		Headers:       withoutDeathHeaders(d.Headers),
+		Headers:       headers,
+		Properties:    properties(d, headers),
 		Deaths:        toDeaths(d.Headers["x-death"]),
 	}
 }

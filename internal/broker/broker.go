@@ -23,6 +23,7 @@ type Message struct {
 	Timestamp     time.Time      `json:"timestamp,omitzero"`
 	DeliveryCount int            `json:"delivery_count,omitempty"`
 	Headers       map[string]any `json:"headers,omitempty"`
+	Properties    map[string]any `json:"properties,omitempty"`
 	Deaths        []Death        `json:"deaths,omitempty"`
 }
 
@@ -84,13 +85,34 @@ type Driver interface {
 }
 
 // Writes are optional capabilities found by type assertion so each broker implements only what it supports
+type Taker interface {
+	// Take reads like Browse but hands visit a function that removes the message, and every message visit doesn't remove goes back
+	Take(ctx context.Context, queue string, n int, visit func(m Message, remove func() error) (bool, error)) error
+}
+
+type Publisher interface {
+	// Publish returns nil only once the broker confirms it has the copy
+	Publish(ctx context.Context, queue string, m Message) error
+}
+
+// Purger removes every message at once, without reading them
+type Purger interface {
+	Purge(ctx context.Context, queue string) error
+}
+
 type Replayer interface {
-	Replay(ctx context.Context, queue string, opts ReplayOptions, each func(Replayed)) error
+	Taker
+	Publisher
 }
 
 type ReplayOptions struct {
 	Selection
 	To string
+}
+
+type RemoveOptions struct {
+	Selection
+	Backup func(Message) error
 }
 
 var ErrNoOrigin = errors.New("no dead-letter history, pass --to to choose a destination")
@@ -104,44 +126,67 @@ func (o ReplayOptions) Target(m Message) (string, error) {
 	return to, nil
 }
 
-type Replayed struct {
+type Taken struct {
 	Message Message
 	To      string
 	Err     error
 }
 
-type ReplayRun struct {
-	opts    ReplayOptions
-	each    func(Replayed)
+// A send that timed out may have reached its destination anyway, so the replay stops instead of risking more
+func Replay(ctx context.Context, d Replayer, queue string, opts ReplayOptions, each func(Taken)) error {
+	r := &run{sel: opts.Selection, each: each, stop: func(err error) bool { return errors.Is(err, context.DeadlineExceeded) }}
+	r.keep = func(m Message) (string, error) {
+		to, err := opts.Target(m)
+		if err == nil {
+			err = d.Publish(ctx, to, m)
+		}
+		return to, err
+	}
+
+	return d.Take(ctx, queue, opts.Scan, r.next)
+}
+
+// A backup that fails ends the run, since every message after it would fail the same way
+func Remove(ctx context.Context, d Taker, queue string, opts RemoveOptions, each func(Taken)) error {
+	r := &run{sel: opts.Selection, each: each, stop: func(error) bool { return true }}
+	r.keep = func(m Message) (string, error) {
+		if opts.Backup == nil {
+			return "", nil
+		}
+		return "", opts.Backup(m)
+	}
+
+	return d.Take(ctx, queue, opts.Scan, r.next)
+}
+
+type run struct {
+	sel     Selection
+	keep    func(Message) (to string, err error)
+	stop    func(error) bool
+	each    func(Taken)
 	matched int
 }
 
-func (o ReplayOptions) Start(each func(Replayed)) *ReplayRun {
-	return &ReplayRun{opts: o, each: each}
-}
-
-// A message is removed only after send succeeds, and a failed remove ends the run because the message is then in both queues
-func (r *ReplayRun) Next(m Message, send func(to string) error, remove func() error) (Replayed, bool, error) {
-	res := Replayed{Message: m}
-	if !r.opts.Filter.Match(m) {
+// A message is removed only after keep succeeds, and a failed remove ends the run because the message is then both kept and still queued
+func (r *run) next(m Message, remove func() error) (bool, error) {
+	res := Taken{Message: m}
+	if !r.sel.Filter.Match(m) {
 		res.Err = ErrSkipped
 		r.each(res)
 
-		return res, true, nil
+		return true, nil
 	}
 
 	r.matched++
-	if res.To, res.Err = r.opts.Target(m); res.Err == nil {
-		res.Err = send(res.To)
-	}
-
 	var err error
-	if res.Err == nil {
+	if res.To, res.Err = r.keep(m); res.Err == nil {
 		err = remove()
+	} else if r.stop(res.Err) {
+		err = res.Err
 	}
 	r.each(res)
 
-	return res, err == nil && !r.opts.Full(r.matched), err
+	return err == nil && !r.sel.Full(r.matched), err
 }
 
 type Opener func(ctx context.Context, u *url.URL) (Driver, error)

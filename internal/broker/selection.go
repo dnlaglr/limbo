@@ -10,6 +10,7 @@ import (
 
 // Filter is matched by limbo rather than the broker because no supported broker can filter a queue server-side
 type Filter struct {
+	IDs     Rule[string]
 	Reasons Rule[string]
 	Sources Rule[string]
 	Headers Rule[Header]
@@ -42,7 +43,8 @@ var ErrSkipped = errors.New("did not match the filters")
 func (f Filter) Match(m Message) bool {
 	at := m.DiedAt()
 
-	return f.Reasons.match(equal(m.Reason())) &&
+	return f.IDs.match(equal(m.ID)) &&
+		f.Reasons.match(equal(m.Reason())) &&
 		f.Sources.match(equal(m.Origin())) &&
 		f.Headers.match(func(h Header) bool { return h.in(m.Headers) }) &&
 		f.Bodies.match(func(re *regexp.Regexp) bool { return re.Match(m.Body) }) &&
@@ -51,7 +53,7 @@ func (f Filter) Match(m Message) bool {
 }
 
 func (f Filter) IsZero() bool {
-	return f.Reasons.empty() && f.Sources.empty() && f.Headers.empty() && f.Bodies.empty() && f.After.IsZero() && f.Before.IsZero()
+	return f.IDs.empty() && f.Reasons.empty() && f.Sources.empty() && f.Headers.empty() && f.Bodies.empty() && f.After.IsZero() && f.Before.IsZero()
 }
 
 func (s Selection) Full(matched int) bool {

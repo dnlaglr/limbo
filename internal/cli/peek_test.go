@@ -68,6 +68,7 @@ var (
 		Timestamp:     publishedAt,
 		DeliveryCount: 18,
 		Headers:       map[string]any{"tenant": "acme"},
+		Properties:    map[string]any{"app_id": "shop"},
 		Deaths: []broker.Death{
 			{Queue: "orders", Reason: "rejected", Count: 3, Time: rejectedAt, Exchange: "shop", RoutingKeys: []string{"order.created"}},
 		},
@@ -79,6 +80,11 @@ var (
 		Deaths: []broker.Death{{Queue: "payments", Reason: "expired", Count: 1, Time: rejectedAt.Add(-time.Hour)}},
 	}
 )
+
+const rejectedOrderJSON = `{"id":"4f1c2a7e","queue":"orders.dlq","content_type":"application/json","timestamp":"2026-11-18T14:02:11Z",` +
+	`"delivery_count":18,"headers":{"tenant":"acme"},"properties":{"app_id":"shop"},"deaths":[{"queue":"orders","reason":"rejected","count":3,` +
+	`"time":"2026-11-18T14:05:40Z","exchange":"shop","routing_keys":["order.created"]}],` +
+	`"body":"{\"orderId\":1042}","body_encoding":"utf-8"}`
 
 func TestPeekText(t *testing.T) {
 	hostile := broker.Message{Queue: "orders.dlq", Body: []byte("\x1b]0;pwned\x07 hello")}
@@ -129,11 +135,7 @@ func TestPeekJSON(t *testing.T) {
 		t.Fatalf("exit code = %d, stderr:\n%s", code, errOut)
 	}
 
-	want := `{"id":"4f1c2a7e","queue":"orders.dlq","content_type":"application/json","timestamp":"2026-11-18T14:02:11Z",` +
-		`"delivery_count":18,"headers":{"tenant":"acme"},"deaths":[{"queue":"orders","reason":"rejected","count":3,` +
-		`"time":"2026-11-18T14:05:40Z","exchange":"shop","routing_keys":["order.created"]}],` +
-		`"body":"{\"orderId\":1042}","body_encoding":"utf-8"}` + "\n" +
-		`{"queue":"orders.dlq","body":"/wAB","body_encoding":"base64"}` + "\n"
+	want := rejectedOrderJSON + "\n" + `{"queue":"orders.dlq","body":"/wAB","body_encoding":"base64"}` + "\n"
 	if out != want {
 		t.Errorf("stdout =\n%s\nwant\n%s", out, want)
 	}
@@ -168,6 +170,15 @@ func TestPeekFiltered(t *testing.T) {
 	}
 }
 
+func TestPeekByID(t *testing.T) {
+	d := browsing(rejectedOrder, expiredPayment, orphan)
+
+	code, out, errOut := runWith(t, fakeBrokers(d), "peek", "orders.dlq", "--url", "fake://x", "--id", expiredPayment.ID)
+	if code != exitOK || !strings.Contains(out, "orders.dlq  1/1") || !strings.Contains(out, expiredPayment.ID) || strings.Contains(out, rejectedOrder.ID) {
+		t.Errorf("exit code %d, stdout:\n%s\nwant only %s; stderr:\n%s", code, out, expiredPayment.ID, errOut)
+	}
+}
+
 func TestPeekErrors(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -183,6 +194,8 @@ func TestPeekErrors(t *testing.T) {
 		{"bad regex", []string{"--url", "fake://x", "--body", "("}, nil, `invalid argument "(" for "--body" flag: error parsing regexp`},
 		{"bad age", []string{"--url", "fake://x", "--older-than", "3w"}, nil, "use a positive duration such as 30m, 2h or 7d"},
 		{"nameless header", []string{"--url", "fake://x", "--not-header", "=acme"}, nil, "name the header, as key or key=value"},
+		{"empty id", []string{"--url", "fake://x", "--id="}, nil, "an ID can't be empty"},
+		{"empty not-id", []string{"--url", "fake://x", "--not-id", ""}, nil, "an ID can't be empty"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

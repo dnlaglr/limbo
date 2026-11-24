@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	filterHelp = `Filters pick messages by their last death, headers, body and age. Different filters must all match, a filter given
-more than once matches any of its values, and --not-* filters skip every message they match. Age is the time of the
-last death, or the publish time when the broker records no death time, as on SQS.`
+	filterHelp = `Filters pick messages by their ID, last death, headers, body and age. Different filters must all match, a filter
+given more than once matches any of its values, and --not-* filters skip every message they match. Age is the time of
+the last death, or the publish time when the broker records no death time, as on SQS. On RabbitMQ the ID is the
+message_id its publisher set, which can be missing or shared by several messages.`
 	readHelp = `Brokers may record each read as a delivery. RabbitMQ marks the messages as redelivered, and quorum queues before
 RabbitMQ 4.3 count each read toward their delivery limit. SQS adds each read to a message's receive count and hides
 the message from other consumers until limbo returns it, or for up to 5 minutes if limbo is killed. SQS FIFO queues
@@ -33,6 +34,8 @@ type filterOptions struct {
 
 func addFilterFlags(cmd *cobra.Command, o *filterOptions) {
 	f, flags := &o.filter, cmd.Flags()
+	flags.Var(listOf(&f.IDs.Any, parseID, "id"), "id", "only messages with this ID")
+	flags.Var(listOf(&f.IDs.None, parseID, "id"), "not-id", "skip messages with this ID")
 	flags.StringArrayVar(&f.Reasons.Any, "reason", nil, "only messages whose last death had this reason, such as rejected, expired, maxlen or delivery_limit")
 	flags.StringArrayVar(&f.Reasons.None, "not-reason", nil, "skip messages whose last death had this reason")
 	flags.StringArrayVar(&f.Sources.Any, "from", nil, "only messages that last died in this queue")
@@ -77,19 +80,22 @@ func count(ctx context.Context, a *app.App, d broker.Driver, queue string, also 
 	return n, err
 }
 
-func browse(ctx context.Context, a *app.App, d broker.Driver, queue string, sel broker.Selection, keep func(broker.Message)) (scanned int, err error) {
+// A keep error stops the read, and every message read goes back as usual
+func browse(ctx context.Context, a *app.App, d broker.Driver, queue string, sel broker.Selection, keep func(broker.Message) error) (scanned int, err error) {
 	matched := 0
 	err = a.UI.Progress(ctx, "Reading "+queue, func(ctx context.Context, set func(float64)) error {
-		return d.Browse(ctx, queue, sel.Scan, func(m broker.Message) bool {
+		var kept error
+		err := d.Browse(ctx, queue, sel.Scan, func(m broker.Message) bool {
 			scanned++
 			set(float64(scanned) / float64(sel.Scan))
 			if sel.Filter.Match(m) {
 				matched++
-				keep(m)
+				kept = keep(m)
 			}
 
-			return !sel.Full(matched)
+			return kept == nil && !sel.Full(matched)
 		})
+		return errors.Join(kept, err)
 	})
 	if err == nil && scanned < sel.Scan && !sel.Full(matched) {
 		a.UI.Warn(fmt.Sprintf("Read only %d of the %s counted in %s. Other consumers may have taken the rest, or the broker held "+
@@ -148,6 +154,15 @@ func (l list[T]) Set(s string) error {
 func (l list[T]) String() string { return "" }
 
 func (l list[T]) Type() string { return l.kind }
+
+// An empty ID would match every message without one, which on RabbitMQ can be the whole queue
+func parseID(s string) (string, error) {
+	if s == "" {
+		return "", errors.New("an ID can't be empty")
+	}
+
+	return s, nil
+}
 
 func parseHeader(s string) (broker.Header, error) {
 	key, value, hasValue := strings.Cut(s, "=")
